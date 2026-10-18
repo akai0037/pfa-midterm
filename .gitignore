@@ -1,0 +1,9 @@
+# made by the tool when you run it
+*_its/
+!examples/sample_illustration_its/
+examples/sample_illustration_its/*
+!examples/sample_illustration_its/ai_03_tree.glb
+
+__pycache__/
+*.pyc
+.DS_Store
