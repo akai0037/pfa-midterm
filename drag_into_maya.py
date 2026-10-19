@@ -25,6 +25,11 @@ def install(repo=None, add_shelf_button=True, open_tool=True):
     import maya.cmds as cmds
     import maya.mel as mel
 
+    if sys.version_info[0] < 3:
+        cmds.confirmDialog(title="Illustration to 3D Scene",
+                           message="This tool needs Maya 2022 or newer (Python 3).",
+                           button=["OK"])
+        return False
     repo = repo or _repo_folder()
     if not repo or not os.path.exists(os.path.join(repo, "illustration_to_scene.py")):
         cmds.confirmDialog(title="Illustration to 3D Scene",

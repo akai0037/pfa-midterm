@@ -60,6 +60,7 @@ except ImportError:  # older Maya
 
 
 TOOL_TITLE = "Illustration to 3D Scene"
+UNDO_KEY = "Cmd+Z" if sys.platform == "darwin" else "Ctrl+Z"
 ROOT_GRP = "illustrationScene_grp"
 NODE_PREFIX = "ITS_"            # every shading node the tool makes starts with this
 FILM_APERTURE = 1.41732          # inches (36 mm, Maya's default film back width)
@@ -99,8 +100,24 @@ def boxes_json_path(image_path):
 # --- OpenCV / cut-outs -------------------------------------------------------
 
 def mayapy_path():
-    loc = os.environ.get("MAYA_LOCATION", os.path.dirname(os.path.dirname(sys.executable)))
-    return os.path.join(loc, "bin", "mayapy.exe" if os.name == "nt" else "mayapy")
+    """Maya's own command-line Python (Windows: bin/mayapy.exe, Mac: Maya.app/Contents/bin/mayapy)."""
+    exe = "mayapy.exe" if os.name == "nt" else "mayapy"
+    candidates = []
+    if os.environ.get("MAYA_LOCATION"):
+        candidates.append(os.path.join(os.environ["MAYA_LOCATION"], "bin", exe))
+    # inside Maya, sys.executable is .../bin/maya(.exe) or .../Maya.app/Contents/MacOS/Maya
+    candidates.append(os.path.join(os.path.dirname(os.path.dirname(sys.executable)), "bin", exe))
+    candidates.append(os.path.join(os.path.dirname(sys.executable), exe))
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    raise RuntimeError("Can't find Maya's mayapy (looked in: %s)" % "; ".join(candidates))
+
+
+def _run_quietly(cmd):
+    """Run a command without a console window popping up on Windows."""
+    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
 def opencv_ok():
@@ -130,15 +147,17 @@ def _forget_cv2():
 
 
 def _opencv_packages():
-    """Pick an OpenCV build that matches the numpy this Maya ships with."""
+    """Pick an OpenCV build that matches the numpy this Maya ships with.
+    Returns (pip arguments, use_deps)."""
     try:
         import numpy
         major = int(numpy.__version__.split(".")[0])
     except Exception:
-        return ["numpy", "opencv-python-headless"]          # no numpy at all: bring both
+        # no numpy in this Maya: let pip bring OpenCV *and* a numpy that fits this Python
+        return ["opencv-python-headless"], True
     if major >= 2:
-        return ["opencv-python-headless"]                    # newest, built for numpy 2
-    return ["opencv-python-headless==4.10.0.84"]            # last build that also works with numpy 1
+        return ["opencv-python-headless"], False             # newest, built for numpy 2
+    return ["opencv-python-headless==4.10.0.84"], False     # last build that also works with numpy 1
 
 
 def install_opencv():
@@ -149,10 +168,11 @@ def install_opencv():
     import time
     target = os.path.join(SITE_ROOT, "cv_%d" % int(time.time()))
     os.makedirs(target, exist_ok=True)
-    cmd = [mayapy_path(), "-m", "pip", "install", "--no-deps", "--target", target] + _opencv_packages()
+    pkgs, use_deps = _opencv_packages()
+    cmd = [mayapy_path(), "-m", "pip", "install", "--target", target] + \
+        ([] if use_deps else ["--no-deps"]) + pkgs
     print("[Illustration to 3D] " + " ".join(cmd))
-    flags = 0x08000000 if os.name == "nt" else 0   # no console window on Windows
-    res = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
+    res = _run_quietly(cmd)
     print(res.stdout[-2000:])
     print(res.stderr[-2000:])
     if res.returncode != 0:
@@ -189,8 +209,7 @@ def install_ai():
     os.makedirs(AI_DIR, exist_ok=True)
     cmd = [mayapy_path(), "-m", "pip", "install", "--upgrade", "--target", AI_DIR, "gradio_client"]
     print("[Illustration to 3D] " + " ".join(cmd))
-    flags = 0x08000000 if os.name == "nt" else 0
-    res = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
+    res = _run_quietly(cmd)
     print(res.stdout[-2000:])
     print(res.stderr[-2000:])
     return res.returncode == 0 and ai_ok()
@@ -1497,7 +1516,7 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         try:
             root, cam, made = builder.build()
             self.status("Built %d proxies and camera '%s'. The viewport now looks through it. "
-                        "Ctrl+Z undoes the whole build." % (len(made), cam))
+                        "%s undoes the whole build." % (len(made), cam, UNDO_KEY))
         except Exception as e:
             traceback.print_exc()
             self.status("Build failed: %s (see Script Editor)" % e, error=True)
@@ -1510,7 +1529,7 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             delete_scene()
         finally:
             cmds.undoInfo(closeChunk=True)
-        self.status("Built scene deleted (Ctrl+Z brings it back).")
+        self.status("Built scene deleted (%s brings it back)." % UNDO_KEY)
 
 
 # ----------------------------------------------------------------------------
