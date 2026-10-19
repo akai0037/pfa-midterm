@@ -114,7 +114,19 @@ def opencv_ok():
         return True
     except Exception as e:
         _cv_error = "%s: %s" % (type(e).__name__, str(e).strip().splitlines()[0] if str(e).strip() else "")
+        _forget_cv2()
         return False
+
+
+def _forget_cv2():
+    """Undo a failed OpenCV import so a different copy can be loaded in the same session.
+    (A failed import leaves a 'loading' flag behind, and the next try reports 'recursion'.)"""
+    for name in list(sys.modules):
+        if name == "cv2" or name.startswith("cv2."):
+            del sys.modules[name]
+    for flag in ("OpenCV_LOADER", "OpenCV_LOADER_DEBUG"):
+        if hasattr(sys, flag):
+            delattr(sys, flag)
 
 
 def _opencv_packages():
@@ -147,15 +159,16 @@ def install_opencv():
         lines = [l for l in (res.stderr or res.stdout).splitlines() if l.strip()]
         return False, "pip failed: " + (lines[-1] if lines else "unknown error")
 
-    # use the new folder first
+    # use the new folder first, forget any copy that failed to load before
     for p in (SITE_DIR, SITE_ROOT):
-        if p in sys.path:
+        while p in sys.path:
             sys.path.remove(p)
     sys.path.insert(0, target)
     SITE_DIR = target
+    _forget_cv2()
     if opencv_ok():
         return True, "OpenCV installed."
-    if "cv2" in sys.modules or "DLL" in _cv_error or "_ARRAY_API" in _cv_error:
+    if "recursion" in _cv_error or "DLL" in _cv_error or "_ARRAY_API" in _cv_error:
         return False, ("OpenCV was downloaded, but Maya still has an older copy loaded. "
                        "Restart Maya and the cut-outs will use the new one.\n\n(%s)" % _cv_error)
     return False, "OpenCV was downloaded but doesn't load in this Maya:\n%s" % _cv_error
