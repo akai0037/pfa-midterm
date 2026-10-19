@@ -16,6 +16,8 @@ A Maya tool that turns a 2D illustration into a 3D scene you can animate. You dr
    - A **2D>3D** button is added to your current shelf.
    - The **Illustration to 3D Scene** window opens.
 4. **One-time OpenCV install.** In the window, under the object list, click **Install OpenCV for cut-outs**, then **Yes**. Maya freezes for 10-60 seconds while it downloads OpenCV (~40 MB, needs internet) into `Documents/maya/its_site-packages`. Nothing in the Maya program folder changes. When it's done the button says **Preview Cutouts**.
+   - If a message says to **restart Maya**, do that and click the button again.
+   - If it still fails, the message shows the reason. The rest of the tool works without OpenCV (Build Scene uses whole-box cards).
 
 Next time, just click the **2D>3D** shelf button.
 

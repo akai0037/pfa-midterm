@@ -27,10 +27,29 @@ import subprocess
 import maya.cmds as cmds
 import maya.OpenMayaUI as omui
 
-# OpenCV (for cutting objects out) gets installed here, outside Maya's own folder
-SITE_DIR = os.path.join(cmds.internalVar(userAppDir=True), "its_site-packages")
+# OpenCV (for cutting objects out) gets installed under here, outside Maya's own folder.
+# Every install goes into its own new sub-folder (cv_<time>), so a copy that Maya has
+# already loaded (and Windows has locked) never has to be overwritten.
+SITE_ROOT = os.path.join(cmds.internalVar(userAppDir=True), "its_site-packages")
+
+
+def _pick_site_dir():
+    """Newest folder that has OpenCV in it; older ones are cleaned up when possible."""
+    import glob
+    import shutil
+    found = sorted((d for d in glob.glob(os.path.join(SITE_ROOT, "cv_*"))
+                    if os.path.isdir(os.path.join(d, "cv2"))), reverse=True)
+    for old in found[1:]:
+        shutil.rmtree(old, ignore_errors=True)     # skipped silently if Windows has it locked
+    if found:
+        return found[0]
+    return SITE_ROOT                                # first version of the tool installed here
+
+
+SITE_DIR = _pick_site_dir()
 if os.path.isdir(SITE_DIR) and SITE_DIR not in sys.path:
-    sys.path.append(SITE_DIR)
+    sys.path.insert(0, SITE_DIR)
+_cv_error = ""
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
@@ -79,41 +98,72 @@ def boxes_json_path(image_path):
 
 # --- OpenCV / cut-outs -------------------------------------------------------
 
+def mayapy_path():
+    loc = os.environ.get("MAYA_LOCATION", os.path.dirname(os.path.dirname(sys.executable)))
+    return os.path.join(loc, "bin", "mayapy.exe" if os.name == "nt" else "mayapy")
+
+
 def opencv_ok():
+    """True if OpenCV (and numpy) load in Maya. On failure the reason is kept in _cv_error."""
+    global _cv_error
     try:
+        import numpy  # noqa: F401
         import cv2  # noqa: F401
         import its_segment  # noqa: F401
+        _cv_error = ""
         return True
-    except Exception:
+    except Exception as e:
+        _cv_error = "%s: %s" % (type(e).__name__, str(e).strip().splitlines()[0] if str(e).strip() else "")
         return False
 
 
+def _opencv_packages():
+    """Pick an OpenCV build that matches the numpy this Maya ships with."""
+    try:
+        import numpy
+        major = int(numpy.__version__.split(".")[0])
+    except Exception:
+        return ["numpy", "opencv-python-headless"]          # no numpy at all: bring both
+    if major >= 2:
+        return ["opencv-python-headless"]                    # newest, built for numpy 2
+    return ["opencv-python-headless==4.10.0.84"]            # last build that also works with numpy 1
+
+
 def install_opencv():
-    """One-time install of OpenCV for Maya's Python (into Documents/maya/its_site-packages).
-    Uses Maya's own numpy, so nothing in the Maya install folder changes."""
-    loc = os.environ.get("MAYA_LOCATION", os.path.dirname(os.path.dirname(sys.executable)))
-    mayapy = os.path.join(loc, "bin", "mayapy.exe" if os.name == "nt" else "mayapy")
-    os.makedirs(SITE_DIR, exist_ok=True)
-    cmd = [mayapy, "-m", "pip", "install", "--no-deps", "--upgrade",
-           "--target", SITE_DIR, "opencv-python-headless==4.10.0.84"]
+    """One-time install of OpenCV for Maya's Python, into a new folder under
+    Documents/maya/its_site-packages. Nothing in the Maya install folder changes.
+    Returns (ok, message)."""
+    global SITE_DIR
+    import time
+    target = os.path.join(SITE_ROOT, "cv_%d" % int(time.time()))
+    os.makedirs(target, exist_ok=True)
+    cmd = [mayapy_path(), "-m", "pip", "install", "--no-deps", "--target", target] + _opencv_packages()
     print("[Illustration to 3D] " + " ".join(cmd))
     flags = 0x08000000 if os.name == "nt" else 0   # no console window on Windows
     res = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
     print(res.stdout[-2000:])
     print(res.stderr[-2000:])
-    if SITE_DIR not in sys.path:
-        sys.path.append(SITE_DIR)
-    return res.returncode == 0 and opencv_ok()
+    if res.returncode != 0:
+        lines = [l for l in (res.stderr or res.stdout).splitlines() if l.strip()]
+        return False, "pip failed: " + (lines[-1] if lines else "unknown error")
+
+    # use the new folder first
+    for p in (SITE_DIR, SITE_ROOT):
+        if p in sys.path:
+            sys.path.remove(p)
+    sys.path.insert(0, target)
+    SITE_DIR = target
+    if opencv_ok():
+        return True, "OpenCV installed."
+    if "cv2" in sys.modules or "DLL" in _cv_error or "_ARRAY_API" in _cv_error:
+        return False, ("OpenCV was downloaded, but Maya still has an older copy loaded. "
+                       "Restart Maya and the cut-outs will use the new one.\n\n(%s)" % _cv_error)
+    return False, "OpenCV was downloaded but doesn't load in this Maya:\n%s" % _cv_error
 
 
 # --- AI image-to-3D (runs outside Maya) ---------------------------------------
 
 AI_DIR = os.path.join(cmds.internalVar(userAppDir=True), "its_ai_packages")
-
-
-def mayapy_path():
-    loc = os.environ.get("MAYA_LOCATION", os.path.dirname(os.path.dirname(sys.executable)))
-    return os.path.join(loc, "bin", "mayapy.exe" if os.name == "nt" else "mayapy")
 
 
 def ai_ok():
@@ -1182,8 +1232,12 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
     def _update_cut_button(self):
         if opencv_ok():
             self.btn_cut.setText("Preview Cutouts")
+            self.btn_cut.setToolTip("Find the object inside each box and cut it out of the drawing\n"
+                                    "(GrabCut). Each object gets its own color.")
         else:
             self.btn_cut.setText("Install OpenCV for cut-outs (one time, ~40 MB)")
+            if _cv_error:
+                self.btn_cut.setToolTip("OpenCV doesn't load yet: " + _cv_error)
 
     def _invalidate_cutouts(self):
         if self.manifest is not None:
@@ -1219,14 +1273,21 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             QtWidgets.QApplication.processEvents()
             QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
             try:
-                done = install_opencv()
+                done, msg = install_opencv()
+            except Exception as e:
+                traceback.print_exc()
+                done, msg = False, "%s: %s" % (type(e).__name__, e)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
             self._update_cut_button()
             if not done:
-                self.status("OpenCV install failed - see the Script Editor.", error=True)
+                self.status("OpenCV not ready: " + msg.splitlines()[0], error=True)
+                QtWidgets.QMessageBox.warning(
+                    self, "OpenCV not ready",
+                    msg + "\n\nThe rest of the tool still works without it: Build Scene "
+                          "uses whole-box cards instead of cut-outs.")
                 return
-            self.status("OpenCV installed.")
+            self.status(msg)
         if not self.image_path or not self.boxes:
             self.status("Load an image and draw some boxes first.", error=True)
             return
