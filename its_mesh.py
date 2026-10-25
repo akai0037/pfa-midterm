@@ -8,6 +8,8 @@ How it works:
      so the edge is a clean curve instead of pixel stairs.
   2. Points are spread evenly along that outline and inside the shape, and
      joined into triangles (Delaunay). Triangles outside the shape are dropped.
+     Delaunay can skip an outline edge, which leaves a chipped corner, so any
+     missing outline edge gets an extra point and the step is repeated.
   3. Each inside point gets a height from how far it is from the edge, shaped
      like a quarter circle, so the middle bulges out and the edge comes down
      to zero, like a balloon in the shape of the drawing. The height map is
@@ -43,7 +45,7 @@ def _resample(contour, step):
     if len(c) < 8:
         return c
     # smooth along the outline (wraps around, it's closed)
-    k = max(2, int(step))
+    k = max(1, int(step / 2))
     kernel = np.ones(2 * k + 1) / (2 * k + 1)
     padded = np.concatenate([c[-k:], c, c[:k]], 0)
     c = np.stack([np.convolve(padded[:, i], kernel, "valid") for i in range(2)], 1)
@@ -137,14 +139,22 @@ def inflate(alpha, detail=60):
 
     step = max(3.0, max(mh, mw) / float(detail))
 
-    # 1. outline points (outer edges and holes)
-    contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    rim = [_resample(c, step) for c in contours if cv2.contourArea(c) > step * step]
-    if not rim:
+    # 1. outlines: outer edges and holes, smoothed, a point every `step` pixels
+    contours, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    rings, shape = [], np.zeros_like(mask)
+    for c, info in zip(contours, hier[0]):
+        if cv2.contourArea(c) <= step * step:
+            continue
+        ring = _resample(c, step)
+        rings.append(ring)
+        # the inside test uses these smoothed outlines, so it agrees with the rim
+        cv2.fillPoly(shape, [np.round(ring * 16).astype(np.int32)], 0 if info[3] >= 0 else 255,
+                     lineType=cv2.LINE_8, shift=4)
+    if not rings:
         return None
-    rim = np.vstack(rim)
+    mask = shape
 
-    # 2. inside points on a staggered grid, kept away from the edge
+    # 2. inside points on a staggered grid, a full step away from the edge
     dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
     inner = []
     row = 0
@@ -152,31 +162,49 @@ def inflate(alpha, detail=60):
     while y < mh:
         x = step / 2.0 + (step / 2.0 if row % 2 else 0.0)
         while x < mw:
-            if dist[int(y), int(x)] > 0.6 * step:
+            if dist[int(y), int(x)] > 0.9 * step:
                 inner.append((x, y))
             x += step
         y += step * 0.866
         row += 1
     inner = np.array(inner, np.float64).reshape(-1, 2)
-    pts = np.vstack([rim, inner])
 
-    # 3. triangles, keep only those inside the shape
-    tris = _triangulate(pts, mw, mh)
+    # 3. triangles. Delaunay doesn't promise to keep the outline's edges, and where
+    # one goes missing the edge gets a chipped corner. So: triangulate, check every
+    # outline edge, put an extra point in the middle of the missing ones, repeat.
+    def inside(p):
+        xi = np.clip(np.round(p[:, 0]).astype(int), 0, mw - 1)
+        yi = np.clip(np.round(p[:, 1]).astype(int), 0, mh - 1)
+        return mask[yi, xi] > 0
+
+    for _ in range(8):
+        rim = np.vstack(rings)
+        pts = np.vstack([rim, inner])
+        tris = _triangulate(pts, mw, mh)
+        if len(tris) == 0:
+            return None
+        a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
+        tris = tris[inside((a + b + c) / 3.0)]
+        have = set(map(tuple, np.sort(np.vstack(
+            [tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1).tolist()))
+        fixed, start, missing = [], 0, 0
+        for ring in rings:
+            n = len(ring)
+            out = []
+            for k in range(n):
+                out.append(ring[k])
+                i, j = start + k, start + (k + 1) % n
+                if (min(i, j), max(i, j)) not in have:
+                    out.append((ring[k] + ring[(k + 1) % n]) / 2.0)
+                    missing += 1
+            fixed.append(np.array(out))
+            start += n
+        if not missing:
+            break
+        rings = fixed
     if len(tris) == 0:
         return None
-    inside = (mask > 0).astype(np.uint8)
-    loose = cv2.dilate(inside, np.ones((3, 3), np.uint8))
 
-    def ok(p):
-        xi = np.clip(p[:, 0].astype(int), 0, mw - 1)
-        yi = np.clip(p[:, 1].astype(int), 0, mh - 1)
-        return loose[yi, xi] > 0
-
-    a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
-    keep = ok((a + b + c) / 3.0) & ok((a + b) / 2.0) & ok((b + c) / 2.0) & ok((a + c) / 2.0)
-    tris = tris[keep]
-    if len(tris) == 0:
-        return None
     # point order faces +z once y is flipped to up: make every triangle wind the same way
     a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
     cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
