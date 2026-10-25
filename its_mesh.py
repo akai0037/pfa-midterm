@@ -228,6 +228,36 @@ def _quad_part(shape, rings, s, strict=True):
 
 
 
+def split_thin(alpha, detail=40):
+    """Split a cut-out into the part that becomes a 3D mesh and the thin bits that
+    stay flat (legs, antennas, hair...). Thin bits are thinner than a grid cell, so
+    the mesh can't follow them; shown on a flat card they look exactly like the drawing.
+    Returns (body_alpha, thin_alpha), both the same size as alpha."""
+    h, w = alpha.shape[:2]
+    scale = float(WORK) / max(h, w)
+    mask = _smooth_mask(alpha, scale)
+    s = max(4.0, max(mask.shape) / float(detail))
+    # "opening" = shrink then grow back: anything thinner than ~a cell disappears
+    k = int(round(s * 1.2)) | 1
+    body = cv2.morphologyEx(mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(body, connectivity=8)
+    for i in range(1, n):
+        if stats[i, cv2.CC_STAT_AREA] < 2 * s * s:          # crumbs: leave them flat too
+            body[labels == i] = 0
+    body = cv2.resize(body, (w, h), interpolation=cv2.INTER_LINEAR) > 127
+    body_alpha = np.where(body, alpha, 0).astype(alpha.dtype)
+    # thin bits = what sticks out clearly past the mesh (not the soft edge all around it),
+    # then grown a few pixels so each one tucks in under the mesh with no gap
+    out = ((alpha > 127) & ~(cv2.dilate(body.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(out.astype(np.uint8), connectivity=8)
+    keep = np.zeros(n, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= 20
+    out = keep[labels]
+    grown = cv2.dilate(out.astype(np.uint8), np.ones((9, 9), np.uint8)) > 0
+    thin_alpha = np.where(grown, alpha, 0).astype(alpha.dtype)
+    return body_alpha, thin_alpha
+
+
 def inflate(alpha, detail=40):
     """detail = roughly how many quads across the object's longest side."""
     h, w = alpha.shape[:2]
