@@ -251,6 +251,10 @@ def segment(image_path, boxes, out_dir=None, progress=None):
         # shows bits of the object); the background fill paints both over
         union = cv2.bitwise_or(union, cv2.bitwise_or(m, fill))
         own = cv2.bitwise_and(m, cv2.bitwise_not(taken))
+        # a nearer object sitting fully inside this one (a window on a UFO) would punch
+        # a hole through it. That part is hidden, not missing: keep it, painted in
+        covered = cv2.bitwise_and(cv2.bitwise_and(_fill_holes(own), cv2.bitwise_not(own)), taken)
+        fill = cv2.bitwise_or(fill, covered)
         own = cv2.bitwise_or(own, fill)            # ...but belongs to this object's card
         taken = cv2.bitwise_or(taken, m)
 
