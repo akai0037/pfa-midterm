@@ -340,16 +340,10 @@ class SceneBuilder(object):
         """Shader that shows only the (x, y, w, h) pixel region of the image.
         With path= it shows that whole picture instead (x=y=0, w=W, h=H).
         alpha=True uses the picture's transparency (cut-out objects).
-        lit=True: lit by the scene's lights, so a 3D shape shows its form."""
-        if lit:
-            # Lambert: light and shadow show the bulge. Full diffuse + some ambient keeps
-            # the side facing the camera close to the drawing's colors
-            mtl = cmds.shadingNode("lambert", asShader=True, name=NODE_PREFIX + tag + "_mtl")
-            cmds.setAttr(mtl + ".diffuse", 1.0)
-            cmds.setAttr(mtl + ".ambientColor", 0.35, 0.35, 0.35, type="double3")
-        else:
-            # unlit surface shader: shows the drawing's colors exactly, and its alpha
-            mtl = cmds.shadingNode("surfaceShader", asShader=True, name=NODE_PREFIX + tag + "_mtl")
+        lit=True: darker where the surface turns away from the camera, so a 3D shape
+        shows its form while the side facing the camera keeps the drawing's colors."""
+        # unlit surface shader: shows the drawing's colors exactly, and its alpha
+        mtl = cmds.shadingNode("surfaceShader", asShader=True, name=NODE_PREFIX + tag + "_mtl")
         sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True,
                        name=NODE_PREFIX + tag + "_SG")
         cmds.connectAttr(mtl + ".outColor", sg + ".surfaceShader", force=True)
@@ -373,14 +367,25 @@ class SceneBuilder(object):
             cmds.setAttr(p2d + ".repeatUV", w / self.W, h / self.H, type="double2")
             cmds.setAttr(p2d + ".offset", x / self.W, 1.0 - (y + h) / self.H, type="double2")
 
+        color = fnode + ".outColor"
         if lit:
-            cmds.connectAttr(fnode + ".outColor", mtl + ".color", force=True)
-            if alpha:
-                cmds.connectAttr(fnode + ".outTransparency", mtl + ".transparency", force=True)
-        else:
-            cmds.connectAttr(fnode + ".outColor", mtl + ".outColor", force=True)
-            if alpha:
-                cmds.connectAttr(fnode + ".outTransparency", mtl + ".outTransparency", force=True)
+            # shade by how much the surface faces the camera: facing it = the drawing's
+            # exact color, turning away = darker (down to 45%), so the round shape shows.
+            # No lights involved, so the colors stay the drawing's own
+            si = cmds.shadingNode("samplerInfo", asUtility=True, name=NODE_PREFIX + tag + "_facing")
+            rng = cmds.shadingNode("setRange", asUtility=True, name=NODE_PREFIX + tag + "_shade")
+            for ax in "XYZ":
+                cmds.connectAttr(si + ".facingRatio", rng + ".value" + ax, force=True)
+                cmds.setAttr(rng + ".oldMax" + ax, 1.0)
+                cmds.setAttr(rng + ".min" + ax, 0.45)
+                cmds.setAttr(rng + ".max" + ax, 1.0)
+            mult = cmds.shadingNode("multiplyDivide", asUtility=True, name=NODE_PREFIX + tag + "_mult")
+            cmds.connectAttr(color, mult + ".input1", force=True)
+            cmds.connectAttr(rng + ".outValue", mult + ".input2", force=True)
+            color = mult + ".output"
+        cmds.connectAttr(color, mtl + ".outColor", force=True)
+        if alpha:
+            cmds.connectAttr(fnode + ".outTransparency", mtl + ".outTransparency", force=True)
         return sg
 
     def cube_shader(self, i, tag):
@@ -531,7 +536,7 @@ class SceneBuilder(object):
             # the mesh already has the object's shape, so it's solid (no see-through):
             # its texture is the cut-out with the empty area filled by the object's
             # edge colors, so the rim doesn't pick up transparent or background pixels.
-            # Lit, so the light and shadow show that it's round
+            # Shaded by facing angle, so you can see that it's round
             sg = self.textured_shader(tag, 0, 0, self.W, self.H, path=bleed_texture(cut),
                                       alpha=False, lit=True)
             node = self.make_inflated(name, b, cut, sg, parent, index=i, thick=thick)
