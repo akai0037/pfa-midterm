@@ -3,84 +3,233 @@ its_mesh  -  turn a cut-out object into a puffy 3D mesh ("inflate").
 
 Part of the Illustration to 3D Scene tool. numpy + OpenCV only, no Maya.
 
-The object's silhouette (alpha channel of the cut-out PNG) is put on a grid.
-Each point gets a height from how far it is from the edge, shaped like a
-quarter circle, so the middle bulges out and the edges come down to zero,
-like blowing up a balloon in the shape of the drawing. The back is a mirror
-of the front, and front and back share the edge vertices, so the mesh is
-closed.
+How it works:
+  1. The object's outline is traced from the cut-out's alpha and smoothed,
+     so the edge is a clean curve instead of pixel stairs.
+  2. Points are spread evenly along that outline and inside the shape, and
+     joined into triangles (Delaunay). Triangles outside the shape are dropped.
+  3. Each inside point gets a height from how far it is from the edge, shaped
+     like a quarter circle, so the middle bulges out and the edge comes down
+     to zero, like a balloon in the shape of the drawing. The height map is
+     blurred first, so there's no sharp ridge down the middle.
+  4. The back is a mirror of the front. Front and back share the outline
+     points, so the mesh is closed.
 
 inflate(alpha) returns, in the cut-out's pixel space:
     verts  (N, 3)  x right, y down (pixels), z = puff in -1..1
-    quads  (M, 4)  vertex indices, front faces point toward +z (the camera)
+    faces  (M, 3)  triangles, front faces point toward +z (the camera)
     uvs    (N, 2)  0..1, v up (Maya style)
 """
 
 import numpy as np
 import cv2
 
+WORK = 512          # the mask is processed at this size (longest side)
 
-def inflate(alpha, grid=90):
+
+def _smooth_mask(alpha, scale):
+    """Alpha -> clean 0/255 mask at working size: no pixel stairs, no specks."""
     h, w = alpha.shape[:2]
-    s = float(grid) / max(h, w)
-    gw, gh = max(2, int(round(w * s))), max(2, int(round(h * s)))
-    small = cv2.resize(alpha, (gw, gh), interpolation=cv2.INTER_AREA)
-    cells = small > 127
-    if cells.sum() < 3:
+    m = cv2.resize(alpha, (max(2, int(round(w * scale))), max(2, int(round(h * scale)))),
+                   interpolation=cv2.INTER_AREA)
+    m = cv2.GaussianBlur(m, (0, 0), 2.0)            # rounds off jaggies
+    m = np.where(m > 127, 255, 0).astype(np.uint8)
+    return m
+
+
+def _resample(contour, step):
+    """Smooth a closed outline and put points on it every `step` pixels."""
+    c = contour.reshape(-1, 2).astype(np.float64)
+    if len(c) < 8:
+        return c
+    # smooth along the outline (wraps around, it's closed)
+    k = max(2, int(step))
+    kernel = np.ones(2 * k + 1) / (2 * k + 1)
+    padded = np.concatenate([c[-k:], c, c[:k]], 0)
+    c = np.stack([np.convolve(padded[:, i], kernel, "valid") for i in range(2)], 1)
+    # even spacing
+    seg = np.linalg.norm(np.diff(np.vstack([c, c[:1]]), axis=0), axis=1)
+    total = seg.sum()
+    n = max(8, int(total / step))
+    t = np.concatenate([[0], np.cumsum(seg)])
+    targets = np.linspace(0, total, n, endpoint=False)
+    closed = np.vstack([c, c[:1]])
+    x = np.interp(targets, t, closed[:, 0])
+    y = np.interp(targets, t, closed[:, 1])
+    return np.stack([x, y], 1)
+
+
+def _triangulate(points, w, h):
+    """Delaunay triangles of the points (indices into points)."""
+    sub = cv2.Subdiv2D((-2, -2, w + 4, h + 4))
+    lookup = {}
+    for i, (x, y) in enumerate(points):
+        key = (round(float(x), 3), round(float(y), 3))
+        if key in lookup:
+            continue
+        lookup[key] = i
+        sub.insert((float(x), float(y)))
+    tris = []
+    for t in sub.getTriangleList():
+        ids = []
+        for j in range(3):
+            key = (round(float(t[2 * j]), 3), round(float(t[2 * j + 1]), 3))
+            if key not in lookup:
+                break
+            ids.append(lookup[key])
+        if len(ids) == 3:
+            tris.append(ids)
+    return np.array(tris, np.int64).reshape(-1, 3)
+
+
+def _split_necks(pts, tris, is_rim, inner_edges):
+    """Split every inside edge whose two ends are both on the rim."""
+    necks = [tuple(e) for e in inner_edges if is_rim[e[0]] and is_rim[e[1]]]
+    if not necks:
+        return pts, tris, is_rim
+    # split at most one edge per triangle in each pass (the rest wait for the next pass)
+    owner = {}
+    for k, t in enumerate(tris):
+        for j in range(3):
+            a, b = t[j], t[(j + 1) % 3]
+            owner.setdefault((min(a, b), max(a, b)), []).append(k)
+    busy, chosen = set(), []
+    for e in necks:
+        ks = owner.get(e, [])
+        if not any(k in busy for k in ks):
+            busy.update(ks)
+            chosen.append(e)
+    necks = chosen
+    mid = {}
+    new_pts = [pts]
+    n = len(pts)
+    for a, b in necks:
+        mid[(a, b)] = n
+        new_pts.append(((pts[a] + pts[b]) / 2.0)[None])
+        n += 1
+    out = []
+    for t in tris:
+        for j in range(3):
+            a, b, c = t[j], t[(j + 1) % 3], t[(j + 2) % 3]
+            m = mid.get((min(a, b), max(a, b)))
+            if m is not None:
+                out += [[a, m, c], [m, b, c]]    # same winding as t
+                break
+        else:
+            out.append(list(t))
+    tris = np.array(out, np.int64)
+    pts = np.vstack(new_pts)
+    is_rim = np.concatenate([is_rim, np.zeros(len(necks), bool)])
+    # a triangle can have two neck edges: repeat until none are left
+    e = np.sort(np.vstack([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
+    uniq, counts = np.unique(e, axis=0, return_counts=True)
+    return _split_necks(pts, tris, is_rim, uniq[counts == 2])
+
+
+def inflate(alpha, detail=60):
+    """detail = roughly how many points across the object's longest side."""
+    h, w = alpha.shape[:2]
+    scale = float(WORK) / max(h, w)
+    mask = _smooth_mask(alpha, scale)
+    mh, mw = mask.shape
+    if cv2.countNonZero(mask) < 20:
         return None
 
-    # distance from the edge -> rounded profile (quarter circle)
-    pad = np.pad(cells.astype(np.uint8), 1)
-    dt = cv2.distanceTransform(pad, cv2.DIST_L2, 5)[1:-1, 1:-1]
-    dt = dt / max(dt.max(), 1e-6)
-    prof = np.sqrt(np.clip(1.0 - (1.0 - dt) ** 2, 0, 1)) * cells
+    step = max(3.0, max(mh, mw) / float(detail))
 
-    # corners of the cells: used if touching any inside cell,
-    # height = average of the 4 cells if all inside, else 0 (the rim)
-    c = np.pad(cells, 1)
-    p = np.pad(prof, 1)
-    tl, tr, bl, br = c[:-1, :-1], c[:-1, 1:], c[1:, :-1], c[1:, 1:]
-    used = tl | tr | bl | br
-    inner = tl & tr & bl & br
-    height = np.where(inner, (p[:-1, :-1] + p[:-1, 1:] + p[1:, :-1] + p[1:, 1:]) / 4.0, 0.0)
+    # 1. outline points (outer edges and holes)
+    contours, _ = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    rim = [_resample(c, step) for c in contours if cv2.contourArea(c) > step * step]
+    if not rim:
+        return None
+    rim = np.vstack(rim)
 
-    rows, cols = np.nonzero(used)
-    front_id = -np.ones(used.shape, np.int64)
-    front_id[rows, cols] = np.arange(len(rows))
-    xs = cols / float(gw) * w
-    ys = rows / float(gh) * h
-    zs = height[rows, cols]
-    verts = [np.stack([xs, ys, zs], 1)]
-    uvs = [np.stack([cols / float(gw), 1.0 - rows / float(gh)], 1)]
+    # 2. inside points on a staggered grid, kept away from the edge
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    inner = []
+    row = 0
+    y = step / 2.0
+    while y < mh:
+        x = step / 2.0 + (step / 2.0 if row % 2 else 0.0)
+        while x < mw:
+            if dist[int(y), int(x)] > 0.6 * step:
+                inner.append((x, y))
+            x += step
+        y += step * 0.866
+        row += 1
+    inner = np.array(inner, np.float64).reshape(-1, 2)
+    pts = np.vstack([rim, inner])
 
-    # back vertices only where the surface is off the rim
-    back_id = front_id.copy()
-    puffy = (used & (height > 0))
-    br_rows, br_cols = np.nonzero(puffy)
-    back_id[br_rows, br_cols] = len(rows) + np.arange(len(br_rows))
-    verts.append(np.stack([br_cols / float(gw) * w, br_rows / float(gh) * h,
-                           -height[br_rows, br_cols]], 1))
-    uvs.append(np.stack([br_cols / float(gw), 1.0 - br_rows / float(gh)], 1))
+    # 3. triangles, keep only those inside the shape
+    tris = _triangulate(pts, mw, mh)
+    if len(tris) == 0:
+        return None
+    inside = (mask > 0).astype(np.uint8)
+    loose = cv2.dilate(inside, np.ones((3, 3), np.uint8))
 
-    # faces: corner (r, c) is the top-left of cell (r, c)
-    r, cc = np.nonzero(cells)
-    a = (r, cc)              # top-left
-    b = (r, cc + 1)          # top-right
-    d2 = (r + 1, cc + 1)     # bottom-right
-    d = (r + 1, cc)          # bottom-left
-    # y points down in pixels, so this order faces +z once y is flipped to up
-    front = np.stack([front_id[d], front_id[d2], front_id[b], front_id[a]], 1)
-    back = np.stack([back_id[a], back_id[b], back_id[d2], back_id[d]], 1)
-    quads = np.concatenate([front, back], 0)
+    def ok(p):
+        xi = np.clip(p[:, 0].astype(int), 0, mw - 1)
+        yi = np.clip(p[:, 1].astype(int), 0, mh - 1)
+        return loose[yi, xi] > 0
 
-    return np.concatenate(verts, 0), quads, np.concatenate(uvs, 0)
+    a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
+    keep = ok((a + b + c) / 3.0) & ok((a + b) / 2.0) & ok((b + c) / 2.0) & ok((a + c) / 2.0)
+    tris = tris[keep]
+    if len(tris) == 0:
+        return None
+    # point order faces +z once y is flipped to up: make every triangle wind the same way
+    a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
+    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+    flip = cross > 0     # same winding as the old grid mesh (negative in y-down pixels)
+    tris[flip] = tris[flip][:, [0, 2, 1]]
+
+    # drop points no triangle uses (renumber)
+    used = np.zeros(len(pts), bool)
+    used[tris.reshape(-1)] = True
+    new_id = -np.ones(len(pts), np.int64)
+    new_id[used] = np.arange(used.sum())
+    pts = pts[used]
+    tris = new_id[tris]
+
+    # the mesh's open edge = edges used by only one triangle. Points on it are the
+    # rim: they sit at z = 0 and are shared by front and back, which closes the mesh.
+    e = np.sort(np.vstack([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
+    uniq, counts = np.unique(e, axis=0, return_counts=True)
+    is_rim = np.zeros(len(pts), bool)
+    is_rim[uniq[counts == 1].reshape(-1)] = True
+    # an inside edge between two rim points (a thin neck) would be shared by front
+    # and back too, which breaks the mesh: split it with a new point in the middle
+    pts, tris, is_rim = _split_necks(pts, tris, is_rim, uniq[counts == 2])
+
+    # 4. height: blurred distance from the edge, quarter-circle profile
+    soft = cv2.GaussianBlur(dist, (0, 0), max(1.0, step * 0.8))
+    soft = soft / max(float(soft.max()), 1e-6)
+    xi = np.clip(pts[:, 0].astype(int), 0, mw - 1)
+    yi = np.clip(pts[:, 1].astype(int), 0, mh - 1)
+    t = np.clip(soft[yi, xi], 0.0, 1.0)
+    z = np.sqrt(np.clip(1.0 - (1.0 - t) ** 2, 0.0, 1.0))
+    z[is_rim] = 0.0
+
+    # 5. front + mirrored back, sharing the rim points
+    n = len(pts)
+    back_id = np.arange(n)
+    off = np.nonzero(~is_rim)[0]
+    back_id[off] = n + np.arange(len(off))
+    verts_px = np.vstack([pts, pts[off]]) / scale       # back to cut-out pixels
+    zs = np.concatenate([z, -z[off]])
+    verts = np.column_stack([verts_px, zs])
+    uv = np.column_stack([verts_px[:, 0] / w, 1.0 - verts_px[:, 1] / h])
+    back = back_id[tris][:, [0, 2, 1]]                  # reversed: faces -z
+    faces = np.vstack([tris, back])
+    return verts, faces, uv
 
 
-def is_closed(quads):
+def is_closed(faces):
     """Every edge used by exactly two faces -> watertight."""
     edges = {}
-    for q in quads:
-        for i in range(4):
-            e = tuple(sorted((int(q[i]), int(q[(i + 1) % 4]))))
+    for f in faces:
+        k = len(f)
+        for i in range(k):
+            e = tuple(sorted((int(f[i]), int(f[(i + 1) % k]))))
             edges[e] = edges.get(e, 0) + 1
     return all(n == 2 for n in edges.values())

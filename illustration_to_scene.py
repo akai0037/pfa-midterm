@@ -452,7 +452,7 @@ class SceneBuilder(object):
         res = its_mesh.inflate(rgba[:, :, 3])
         if res is None:
             return None
-        verts, quads, uvs = res
+        verts, faces, uvs = res
         ph, pw = rgba.shape[:2]
         d = b["dist"]
         x0, y0, _ = self.to_world(b["x"], b["y"], d)
@@ -463,8 +463,8 @@ class SceneBuilder(object):
         pts.setLength(len(verts))
         for k in range(len(verts)):
             pts[k] = om2.MFloatPoint(float(wx[k]), float(wy[k]), float(verts[k, 2]))
-        counts = om2.MIntArray([4] * len(quads))
-        connects = om2.MIntArray(quads.reshape(-1).astype(int).tolist())
+        counts = om2.MIntArray([faces.shape[1]] * len(faces))   # triangles
+        connects = om2.MIntArray(faces.reshape(-1).astype(int).tolist())
         fn = om2.MFnMesh()
         obj = fn.create(pts, counts, connects,
                         uvs[:, 0].astype(float).tolist(), uvs[:, 1].astype(float).tolist())
