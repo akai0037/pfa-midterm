@@ -446,7 +446,8 @@ class SceneBuilder(object):
         # depth 1 + scaleZ, so the thickness can be changed later without rebuilding
         cube = cmds.polyCube(name=name, width=cw, height=ch, depth=1.0,
                              constructionHistory=False)[0]
-        cmds.xform(cube, translation=((x0 + x1) / 2.0, (y0 + y1) / 2.0, -d))
+        # depth 1 for now, front face at the box's distance (apply_thickness sets the real depth)
+        cmds.xform(cube, translation=((x0 + x1) / 2.0, (y0 + y1) / 2.0, -d - 0.5))
         cmds.addAttr(cube, longName="itsIndex", attributeType="long")
         cmds.setAttr(cube + ".itsIndex", index)
         cmds.addAttr(cube, longName="itsFront", attributeType="double")
@@ -479,6 +480,11 @@ class SceneBuilder(object):
         x1, y1, _ = self.to_world(b["x"] + b["w"], b["y"] + b["h"], d)
         wx = x0 + verts[:, 0] / pw * (x1 - x0)
         wy = y0 + verts[:, 1] / ph * (y1 - y0)
+        # build the mesh around its own middle and move it there with translate, so the
+        # move / scale handles sit on the object (not at the origin, where the camera is)
+        cx = (wx.min() + wx.max()) / 2.0
+        cy = (wy.min() + wy.max()) / 2.0
+        wx, wy = wx - cx, wy - cy
         pts = om2.MFloatPointArray()
         pts.setLength(len(verts))
         for k in range(len(verts)):
@@ -491,6 +497,9 @@ class SceneBuilder(object):
         fn.assignUVs(counts, connects)
         node = cmds.rename(om2.MFnDagNode(obj).fullPathName(), name)
         cmds.polySoftEdge(node, angle=180, constructionHistory=False)
+        cmds.setAttr(node + ".translateX", cx)
+        cmds.setAttr(node + ".translateY", cy)
+        cmds.setAttr(node + ".translateZ", -d)
         cmds.sets(node, edit=True, forceElement=sg)
         cmds.addAttr(node, longName="itsIndex", attributeType="long")
         cmds.setAttr(node + ".itsIndex", index)
@@ -719,12 +728,13 @@ def apply_thickness(cube, percent):
     Inflated meshes: they puff out evenly to the front and back of that distance."""
     depth = max(0.001, cmds.getAttr(cube + ".itsMinSide") * percent / 100.0)
     kind = cmds.getAttr(cube + ".itsKind") if cmds.attributeQuery("itsKind", node=cube, exists=True) else "cube"
-    if kind == "inflate":   # mesh z runs -1..1
+    # only the thickness changes; wherever the user has moved the object stays as it is
+    if kind == "inflate":   # mesh z runs -1..1 around the object's middle
         cmds.setAttr(cube + ".scaleZ", depth / 2.0)
-        cmds.setAttr(cube + ".translateZ", cmds.getAttr(cube + ".itsFront"))
-    else:
+    else:                   # cube: its front face stays put, it grows backwards
+        old = cmds.getAttr(cube + ".scaleZ")
         cmds.setAttr(cube + ".scaleZ", depth)
-        cmds.setAttr(cube + ".translateZ", cmds.getAttr(cube + ".itsFront") - depth / 2.0)
+        cmds.setAttr(cube + ".translateZ", cmds.getAttr(cube + ".translateZ") - (depth - old) / 2.0)
 
 
 def set_cube_thickness(index, percent):
