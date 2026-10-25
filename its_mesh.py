@@ -92,7 +92,35 @@ def _quad_part(shape, rings, s, strict=True):
     px = np.clip(((cx + 0.5) * s).astype(int), 0, mw - 1)
     py = np.clip(((cy + 0.5) * s).astype(int), 0, mh - 1)
     inside = dist[py, px] > 0.55 * s
+    # a gap in the grid that the outside can't reach is a hole in the mesh. Keep it
+    # only if a real hole of the shape is there; a notch or a crack that left a few
+    # cells out would otherwise make a fake hole, so fill those in
+    hole_spots = [tuple((r[0].mean(0) // s).astype(int)) for r in rings[1:]]   # (col, row)
     cells = _pick_cells(inside)
+    for _ in range(5):
+        n_gaps, gap_id = cv2.connectedComponents(
+            np.pad((~cells).astype(np.uint8), 1, constant_values=1), connectivity=4)
+        gap_id = gap_id[1:-1, 1:-1]
+        outside = gap_id[0, 0] if not cells[0, 0] else -1
+        changed = False
+        for g in range(1, n_gaps):
+            if g == outside or (gap_id == g).sum() == 0:
+                continue
+            touches_edge = (gap_id[0, :] == g).any() or (gap_id[-1, :] == g).any() or \
+                (gap_id[:, 0] == g).any() or (gap_id[:, -1] == g).any()
+            real = any(0 <= rr < gh and 0 <= cc < gw and gap_id[rr, cc] == g for cc, rr in hole_spots)
+            if not touches_edge and not real:
+                cells[gap_id == g] = True
+                changed = True
+        if not changed:
+            break
+        cells = _pick_cells(cells)
+    # a thin part can cut a few cells off from the rest (e.g. inside a little bump on
+    # the edge). Keep only the biggest connected block; the outline ring covers the rest
+    n_blocks, block = cv2.connectedComponents(cells.astype(np.uint8), connectivity=4)
+    if n_blocks > 2:
+        sizes = np.bincount(block.ravel())[1:]
+        cells = block == (1 + sizes.argmax())
     if cells.sum() < 1:
         return None               # too thin for this cell size
 

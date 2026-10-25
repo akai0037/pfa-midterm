@@ -464,6 +464,8 @@ class SceneBuilder(object):
             return None
         res = its_mesh.inflate(rgba[:, :, 3])
         if res is None:
+            print("[Illustration to 3D] Couldn't make an inflated mesh for '%s'; "
+                  "it gets a flat card instead." % b["name"])
             return None
         verts, faces, uvs = res
         ph, pw = rgba.shape[:2]
