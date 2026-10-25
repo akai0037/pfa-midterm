@@ -513,7 +513,10 @@ class SceneBuilder(object):
                           "using an inflated mesh instead." % b["name"])
 
         if self.proxy_type in (P_INFLATE, P_AI) and cut:
-            sg = self.textured_shader(tag, 0, 0, self.W, self.H, path=cut, alpha=True)
+            # the mesh already has the object's shape, so it's solid (no see-through):
+            # its texture is the cut-out with the empty area filled by the object's
+            # edge colors, so the rim doesn't pick up transparent or background pixels
+            sg = self.textured_shader(tag, 0, 0, self.W, self.H, path=bleed_texture(cut), alpha=False)
             node = self.make_inflated(name, b, cut, sg, parent, index=i, thick=thick)
             if node:
                 return node
