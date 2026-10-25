@@ -457,10 +457,8 @@ class SceneBuilder(object):
         cmds.sets(cube, edit=True, forceElement=sg)
         return cmds.parent(cube, parent)[0]
 
-    def make_inflated(self, name, b, cut_path, sg, parent, index=0, thick=DEFAULT_THICK, tag=None):
-        """Puffy mesh in the shape of the cut-out object (see its_mesh.py). Bits too
-        thin for the mesh (legs, antennas) go on a flat card next to it, so they still
-        look like the drawing; then both are returned together in one group."""
+    def make_inflated(self, name, b, cut_path, sg, parent, index=0, thick=DEFAULT_THICK):
+        """Puffy mesh in the shape of the cut-out object (see its_mesh.py)."""
         import numpy as np
         import cv2
         import its_mesh
@@ -469,8 +467,7 @@ class SceneBuilder(object):
         rgba = cv2.imdecode(np.fromfile(cut_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
         if rgba is None or rgba.ndim < 3 or rgba.shape[2] < 4:
             return None
-        body_alpha, thin_alpha = its_mesh.split_thin(rgba[:, :, 3])
-        res = its_mesh.inflate(body_alpha)
+        res = its_mesh.inflate(rgba[:, :, 3])
         if res is None:
             print("[Illustration to 3D] Couldn't make an inflated mesh for '%s'; "
                   "it gets a flat card instead." % b["name"])
@@ -504,21 +501,7 @@ class SceneBuilder(object):
         cmds.addAttr(node, longName="itsKind", dataType="string")
         cmds.setAttr(node + ".itsKind", "inflate", type="string")
         apply_thickness(node, thick)
-        if not thin_alpha.any():
-            return cmds.parent(node, parent)[0]
-
-        # the thin bits: a flat card over the box at the object's distance, showing only them
-        thin = rgba.copy()
-        thin[:, :, 3] = thin_alpha
-        thin_path = os.path.splitext(cut_path)[0] + "_thin.png"
-        cv2.imencode(".png", thin)[1].tofile(thin_path)
-        flat_sg = self.textured_shader((tag or safe_name(name)) + "_thin", 0, 0, self.W, self.H,
-                                       path=thin_path, alpha=True)
-        node = cmds.rename(node, name.replace("_proxy", "") + "_mesh")   # frees the name for the group
-        grp = cmds.group(empty=True, name=name, parent=parent)
-        node = cmds.parent(node, grp)[0]
-        self.make_card(name.replace("_proxy", "") + "_thin_card", b["x"], b["y"], b["w"], b["h"], d, flat_sg, grp)
-        return grp
+        return cmds.parent(node, parent)[0]
 
     def cut_path(self, i):
         if not self.cutouts:
@@ -556,7 +539,7 @@ class SceneBuilder(object):
             # Shaded by facing angle, so you can see that it's round
             sg = self.textured_shader(tag, 0, 0, self.W, self.H, path=bleed_texture(cut),
                                       alpha=False, lit=True)
-            node = self.make_inflated(name, b, cut, sg, parent, index=i, thick=thick, tag=tag)
+            node = self.make_inflated(name, b, cut, sg, parent, index=i, thick=thick)
             if node:
                 return node
 
