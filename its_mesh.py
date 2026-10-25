@@ -3,23 +3,23 @@ its_mesh  -  turn a cut-out object into a puffy 3D mesh ("inflate").
 
 Part of the Illustration to 3D Scene tool. numpy + OpenCV only, no Maya.
 
-How it works:
-  1. The object's outline is traced from the cut-out's alpha and smoothed,
-     so the edge is a clean curve instead of pixel stairs.
-  2. Points are spread evenly along that outline and inside the shape, and
-     joined into triangles (Delaunay). Triangles outside the shape are dropped.
-     Delaunay can skip an outline edge, which leaves a chipped corner, so any
-     missing outline edge gets an extra point and the step is repeated.
-  3. Each inside point gets a height from how far it is from the edge, shaped
-     like a quarter circle, so the middle bulges out and the edge comes down
-     to zero, like a balloon in the shape of the drawing. The height map is
-     blurred first, so there's no sharp ridge down the middle.
-  4. The back is a mirror of the front. Front and back share the outline
+The mesh is all quads, laid out the way you'd model it by hand:
+  1. The object's outline is traced from the cut-out's alpha and smoothed.
+  2. Inside it, a regular grid of square cells (only cells that sit fully
+     inside, a little away from the edge).
+  3. One ring of quads joins the edge of that grid to the outline: every
+     grid point on the border gets a matching point on the outline. The
+     border points are rounded off a little first, so the grid ends in a
+     smooth line instead of stairs.
+  4. Each point gets a height from how far it is from the edge, shaped like a
+     quarter circle, so the middle bulges out and the edge comes down to zero,
+     like a balloon in the shape of the drawing.
+  5. The back is a mirror of the front. Front and back share the outline
      points, so the mesh is closed.
 
 inflate(alpha) returns, in the cut-out's pixel space:
     verts  (N, 3)  x right, y down (pixels), z = puff in -1..1
-    faces  (M, 3)  triangles, front faces point toward +z (the camera)
+    faces  (M, 4)  quads, front faces point toward +z (the camera)
     uvs    (N, 2)  0..1, v up (Maya style)
 """
 
@@ -35,210 +35,234 @@ def _smooth_mask(alpha, scale):
     m = cv2.resize(alpha, (max(2, int(round(w * scale))), max(2, int(round(h * scale)))),
                    interpolation=cv2.INTER_AREA)
     m = cv2.GaussianBlur(m, (0, 0), 2.0)            # rounds off jaggies
-    m = np.where(m > 127, 255, 0).astype(np.uint8)
-    return m
+    return np.where(m > 127, 255, 0).astype(np.uint8)
 
 
-def _resample(contour, step):
-    """Smooth a closed outline and put points on it every `step` pixels."""
+def _outline(contour, smooth):
+    """Smoothed closed outline with a point every pixel or so.
+    Returns the points (N, 2), the distance along the outline at each, the length."""
     c = contour.reshape(-1, 2).astype(np.float64)
-    if len(c) < 8:
-        return c
-    # smooth along the outline (wraps around, it's closed)
-    k = max(1, int(step / 2))
-    kernel = np.ones(2 * k + 1) / (2 * k + 1)
-    padded = np.concatenate([c[-k:], c, c[:k]], 0)
-    c = np.stack([np.convolve(padded[:, i], kernel, "valid") for i in range(2)], 1)
-    # even spacing
+    k = max(1, int(smooth))
+    if len(c) > 2 * k + 2:
+        kernel = np.ones(2 * k + 1) / (2 * k + 1)
+        padded = np.concatenate([c[-k:], c, c[:k]], 0)
+        c = np.stack([np.convolve(padded[:, i], kernel, "valid") for i in range(2)], 1)
     seg = np.linalg.norm(np.diff(np.vstack([c, c[:1]]), axis=0), axis=1)
-    total = seg.sum()
-    n = max(8, int(total / step))
-    t = np.concatenate([[0], np.cumsum(seg)])
-    targets = np.linspace(0, total, n, endpoint=False)
-    closed = np.vstack([c, c[:1]])
-    x = np.interp(targets, t, closed[:, 0])
-    y = np.interp(targets, t, closed[:, 1])
-    return np.stack([x, y], 1)
+    t = np.concatenate([[0.0], np.cumsum(seg)])
+    return c, t[:-1], t[-1]
 
 
-def _triangulate(points, w, h):
-    """Delaunay triangles of the points (indices into points)."""
-    sub = cv2.Subdiv2D((-2, -2, w + 4, h + 4))
-    lookup = {}
-    for i, (x, y) in enumerate(points):
-        key = (round(float(x), 3), round(float(y), 3))
-        if key in lookup:
+def _point_at(ring, t, length, s):
+    """Point on a closed outline at distance s along it."""
+    s = np.mod(s, length)
+    closed = np.vstack([ring, ring[:1]])
+    tt = np.append(t, length)
+    return np.stack([np.interp(s, tt, closed[:, 0]), np.interp(s, tt, closed[:, 1])], -1)
+
+
+def _pick_cells(inside):
+    """Cells to fill with quads. Where two cells touch only at a corner, the
+    mesh would pinch to a single point there, so one more cell is added."""
+    cells = inside.copy()
+    for _ in range(10):
+        c = np.pad(cells, 1)
+        tl, tr, bl, br = c[:-1, :-1], c[:-1, 1:], c[1:, :-1], c[1:, 1:]
+        pinch = (tl & br & ~tr & ~bl) | (tr & bl & ~tl & ~br)
+        if not pinch.any():
+            break
+        # pinch[r, k] is the grid corner shared by cells (r-1, k-1), (r-1, k), (r, k-1), (r, k)
+        for r, k in zip(*np.nonzero(pinch)):
+            if tl[r, k]:            # top-left + bottom-right -> add top-right
+                cells[r - 1, k] = True
+            else:                   # top-right + bottom-left -> add top-left
+                cells[r - 1, k - 1] = True
+    return cells
+
+
+def _quad_part(shape, rings, s, strict=True):
+    """Quads for one piece of the shape (a 0/255 mask) and its outlines.
+    Returns (points, quads, is_rim), or None if the grid doesn't fit (strict=False
+    accepts a few twisted border quads instead of giving up)."""
+    mh, mw = shape.shape
+    dist = cv2.distanceTransform(shape, cv2.DIST_L2, 5)
+
+    # grid cells whose middle is at least about half a cell inside the outline
+    gw, gh = int(np.ceil(mw / s)) + 1, int(np.ceil(mh / s)) + 1
+    cy, cx = np.mgrid[0:gh, 0:gw]
+    px = np.clip(((cx + 0.5) * s).astype(int), 0, mw - 1)
+    py = np.clip(((cy + 0.5) * s).astype(int), 0, mh - 1)
+    inside = dist[py, px] > 0.55 * s
+    cells = _pick_cells(inside)
+    if cells.sum() < 1:
+        return None               # too thin for this cell size
+
+    # grid corners used by the cells -> vertex ids
+    used = np.zeros((gh + 1, gw + 1), bool)
+    r, c = np.nonzero(cells)
+    for dr, dc in ((0, 0), (0, 1), (1, 0), (1, 1)):
+        used[r + dr, c + dc] = True
+    vid = -np.ones(used.shape, np.int64)
+    vr, vc = np.nonzero(used)
+    vid[vr, vc] = np.arange(len(vr))
+    pts = np.stack([vc * s, vr * s], 1).astype(np.float64)
+
+    # cell quads in the order bottom-left, bottom-right, top-right, top-left
+    # (y is down here, so this faces the camera once y is flipped up in Maya)
+    quads = np.stack([vid[r + 1, c], vid[r + 1, c + 1], vid[r, c + 1], vid[r, c]], 1)
+
+    # border of the grid: directed edges with no partner going the other way,
+    # chained into closed loops
+    edges = set()
+    for q in quads:
+        for k in range(4):
+            edges.add((int(q[k]), int(q[(k + 1) % 4])))
+    nxt = {a: b for (a, b) in edges if (b, a) not in edges}
+    loops, seen = [], set()
+    for start in nxt:
+        if start in seen:
             continue
-        lookup[key] = i
-        sub.insert((float(x), float(y)))
-    tris = []
-    for t in sub.getTriangleList():
-        ids = []
-        for j in range(3):
-            key = (round(float(t[2 * j]), 3), round(float(t[2 * j + 1]), 3))
-            if key not in lookup:
+        loop, v = [], start
+        while v not in seen:
+            seen.add(v)
+            loop.append(v)
+            v = nxt[v]
+        loops.append(loop)
+    # the grid must have one border loop per outline (outer edge + one per hole);
+    # if a thin part split the grid in two, the caller tries smaller cells
+    if len(loops) != len(rings):
+        return None
+
+    # round off the stairs: each border point moves halfway toward the middle of its
+    # two neighbors along the border (the inside of the grid stays a perfect grid)
+    for _ in range(3):
+        for loop in loops:
+            L = np.array(loop)
+            P = pts[L]
+            pts[L] = 0.5 * P + 0.25 * (np.roll(P, 1, 0) + np.roll(P, -1, 0))
+
+    # each border loop gets a twin loop on the outline, one outline point per
+    # grid point, and a quad joins every border edge to its twin
+    rim_pts, strip = [], []
+    n_grid = len(pts)
+    for loop in loops:
+        L = np.array(loop)
+        P = pts[L]
+        # which outline this loop follows, and the nearest spot on it for every point
+        best = None
+        for (ring, t, length) in rings:
+            d = np.linalg.norm(P[:, None, :] - ring[None, ::2, :], axis=2)
+            j = d.argmin(1)
+            score = d[np.arange(len(P)), j].sum()
+            if best is None or score < best[0]:
+                best = (score, ring, t, length, t[::2][j])
+        _, ring, t, length, pos = best
+        # walk along the outline in the loop's direction, never backwards,
+        # go round exactly once, and even out the spacing a little
+        steps = np.mod(np.diff(np.append(pos, pos[0])), length)
+        sign = 1.0
+        if np.median(steps) > length / 2:            # the loop runs the other way round
+            steps = np.mod(-np.diff(np.append(pos, pos[0])), length)
+            sign = -1.0
+        steps = np.where(steps > length / 2, 0.0, steps)
+        steps = np.maximum(steps, 0.05 * s)
+        steps *= length / steps.sum()
+        for _ in range(3):
+            steps = 0.5 * steps + 0.25 * (np.roll(steps, 1) + np.roll(steps, -1))
+        n = len(L)
+        # where a joining quad comes out twisted (its outline side runs backwards),
+        # even out the spacing around it more, and try again
+        for _ in range(20):
+            along = pos[0] + sign * np.concatenate([[0.0], np.cumsum(steps)[:-1]])
+            on_curve = _point_at(ring, t, length, along)
+            quad = np.stack([P[(np.arange(n) + 1) % n], P, on_curve,
+                             on_curve[(np.arange(n) + 1) % n]], 1)
+            x, y = quad[..., 0], quad[..., 1]
+            # (signed area; cell quads are negative, a clearly positive one is twisted)
+            twisted = (x * np.roll(y, -1, 1) - np.roll(x, -1, 1) * y).sum(1) > 0.04 * s * s
+            if not twisted.any():
                 break
-            ids.append(lookup[key])
-        if len(ids) == 3:
-            tris.append(ids)
-    return np.array(tris, np.int64).reshape(-1, 3)
+            spread = twisted | np.roll(twisted, 1) | np.roll(twisted, -1)
+            spread = spread | np.roll(spread, 1) | np.roll(spread, -1)
+            smoothed = (np.roll(steps, 1) + steps + np.roll(steps, -1)) / 3.0
+            steps = np.where(spread, smoothed, steps)
+        if twisted.any() and strict:
+            return None           # this cell size doesn't fit the shape; try smaller cells
+        base = n_grid + sum(len(x) for x in rim_pts)
+        rim_pts.append(on_curve)
+        for k in range(n):
+            a, b = L[k], L[(k + 1) % n]              # grid border edge a -> b
+            a2, b2 = base + k, base + (k + 1) % n    # its twin on the outline
+            strip.append([b, a, a2, b2])             # uses a-b the other way round, like a neighbor cell
+
+    pts = np.vstack([pts] + rim_pts)
+    faces = np.vstack([quads, np.array(strip, np.int64)])
+    return pts, faces, np.arange(len(pts)) >= n_grid
 
 
-def _split_necks(pts, tris, is_rim, inner_edges):
-    """Split every inside edge whose two ends are both on the rim."""
-    necks = [tuple(e) for e in inner_edges if is_rim[e[0]] and is_rim[e[1]]]
-    if not necks:
-        return pts, tris, is_rim
-    # split at most one edge per triangle in each pass (the rest wait for the next pass)
-    owner = {}
-    for k, t in enumerate(tris):
-        for j in range(3):
-            a, b = t[j], t[(j + 1) % 3]
-            owner.setdefault((min(a, b), max(a, b)), []).append(k)
-    busy, chosen = set(), []
-    for e in necks:
-        ks = owner.get(e, [])
-        if not any(k in busy for k in ks):
-            busy.update(ks)
-            chosen.append(e)
-    necks = chosen
-    mid = {}
-    new_pts = [pts]
-    n = len(pts)
-    for a, b in necks:
-        mid[(a, b)] = n
-        new_pts.append(((pts[a] + pts[b]) / 2.0)[None])
-        n += 1
-    out = []
-    for t in tris:
-        for j in range(3):
-            a, b, c = t[j], t[(j + 1) % 3], t[(j + 2) % 3]
-            m = mid.get((min(a, b), max(a, b)))
-            if m is not None:
-                out += [[a, m, c], [m, b, c]]    # same winding as t
-                break
-        else:
-            out.append(list(t))
-    tris = np.array(out, np.int64)
-    pts = np.vstack(new_pts)
-    is_rim = np.concatenate([is_rim, np.zeros(len(necks), bool)])
-    # a triangle can have two neck edges: repeat until none are left
-    e = np.sort(np.vstack([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
-    uniq, counts = np.unique(e, axis=0, return_counts=True)
-    return _split_necks(pts, tris, is_rim, uniq[counts == 2])
 
-
-def inflate(alpha, detail=60):
-    """detail = roughly how many points across the object's longest side."""
+def inflate(alpha, detail=40):
+    """detail = roughly how many quads across the object's longest side."""
     h, w = alpha.shape[:2]
     scale = float(WORK) / max(h, w)
     mask = _smooth_mask(alpha, scale)
     mh, mw = mask.shape
     if cv2.countNonZero(mask) < 20:
         return None
+    s = max(4.0, max(mh, mw) / float(detail))          # cell size (working pixels)
 
-    step = max(3.0, max(mh, mw) / float(detail))
-
-    # 1. outlines: outer edges and holes, smoothed, a point every `step` pixels
+    # 1. smoothed outlines (outer edges and holes) -> a mask that matches them exactly
     contours, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-    rings, shape = [], np.zeros_like(mask)
+    shape = np.zeros_like(mask)
     for c, info in zip(contours, hier[0]):
-        if cv2.contourArea(c) <= step * step:
+        if cv2.contourArea(c) < 4:
             continue
-        ring = _resample(c, step)
-        rings.append(ring)
-        # the inside test uses these smoothed outlines, so it agrees with the rim
+        ring, _, _ = _outline(c, s / 3.0)
         cv2.fillPoly(shape, [np.round(ring * 16).astype(np.int32)], 0 if info[3] >= 0 else 255,
                      lineType=cv2.LINE_8, shift=4)
-    if not rings:
+    dist = cv2.distanceTransform(shape, cv2.DIST_L2, 5)
+
+    # 2 + 3. quads for each separate piece; a small or thin piece gets smaller quads
+    n_pieces, labels = cv2.connectedComponents(shape, connectivity=8)
+    all_pts, all_faces, all_rim = [], [], []
+    count = 0
+    for k in range(1, n_pieces):
+        piece = np.where(labels == k, 255, 0).astype(np.uint8)
+        if cv2.countNonZero(piece) < 12:
+            continue
+        cs, hs = cv2.findContours(piece, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+        rings = [_outline(c, 1) for c in cs if len(c) >= 4]
+        if not rings:
+            continue
+        res = None
+        for size in (s, s / 1.5, s / 2.0, s / 3.0, s / 4.0, s / 6.0):
+            res = _quad_part(piece, rings, max(1.5, size))
+            if res is not None:
+                break
+        if res is None:
+            res = _quad_part(piece, rings, s, strict=False)
+        if res is None:
+            continue              # thinner than the smallest cells: left out
+        p, f, rim = res
+        all_pts.append(p)
+        all_faces.append(f + count)
+        all_rim.append(rim)
+        count += len(p)
+    if not all_pts:
         return None
-    mask = shape
-
-    # 2. inside points on a staggered grid, a full step away from the edge
-    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
-    inner = []
-    row = 0
-    y = step / 2.0
-    while y < mh:
-        x = step / 2.0 + (step / 2.0 if row % 2 else 0.0)
-        while x < mw:
-            if dist[int(y), int(x)] > 0.9 * step:
-                inner.append((x, y))
-            x += step
-        y += step * 0.866
-        row += 1
-    inner = np.array(inner, np.float64).reshape(-1, 2)
-
-    # 3. triangles. Delaunay doesn't promise to keep the outline's edges, and where
-    # one goes missing the edge gets a chipped corner. So: triangulate, check every
-    # outline edge, put an extra point in the middle of the missing ones, repeat.
-    def inside(p):
-        xi = np.clip(np.round(p[:, 0]).astype(int), 0, mw - 1)
-        yi = np.clip(np.round(p[:, 1]).astype(int), 0, mh - 1)
-        return mask[yi, xi] > 0
-
-    for _ in range(8):
-        rim = np.vstack(rings)
-        pts = np.vstack([rim, inner])
-        tris = _triangulate(pts, mw, mh)
-        if len(tris) == 0:
-            return None
-        a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
-        tris = tris[inside((a + b + c) / 3.0)]
-        have = set(map(tuple, np.sort(np.vstack(
-            [tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1).tolist()))
-        fixed, start, missing = [], 0, 0
-        for ring in rings:
-            n = len(ring)
-            out = []
-            for k in range(n):
-                out.append(ring[k])
-                i, j = start + k, start + (k + 1) % n
-                if (min(i, j), max(i, j)) not in have:
-                    out.append((ring[k] + ring[(k + 1) % n]) / 2.0)
-                    missing += 1
-            fixed.append(np.array(out))
-            start += n
-        if not missing:
-            break
-        rings = fixed
-    if len(tris) == 0:
-        return None
-
-    # point order faces +z once y is flipped to up: make every triangle wind the same way
-    a, b, c = pts[tris[:, 0]], pts[tris[:, 1]], pts[tris[:, 2]]
-    cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
-    flip = cross > 0     # same winding as the old grid mesh (negative in y-down pixels)
-    tris[flip] = tris[flip][:, [0, 2, 1]]
-
-    # drop points no triangle uses (renumber)
-    used = np.zeros(len(pts), bool)
-    used[tris.reshape(-1)] = True
-    new_id = -np.ones(len(pts), np.int64)
-    new_id[used] = np.arange(used.sum())
-    pts = pts[used]
-    tris = new_id[tris]
-
-    # the mesh's open edge = edges used by only one triangle. Points on it are the
-    # rim: they sit at z = 0 and are shared by front and back, which closes the mesh.
-    e = np.sort(np.vstack([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
-    uniq, counts = np.unique(e, axis=0, return_counts=True)
-    is_rim = np.zeros(len(pts), bool)
-    is_rim[uniq[counts == 1].reshape(-1)] = True
-    # an inside edge between two rim points (a thin neck) would be shared by front
-    # and back too, which breaks the mesh: split it with a new point in the middle
-    pts, tris, is_rim = _split_necks(pts, tris, is_rim, uniq[counts == 2])
+    pts = np.vstack(all_pts)
+    faces = np.vstack(all_faces)
+    is_rim = np.concatenate(all_rim)
 
     # 4. height: blurred distance from the edge, quarter-circle profile
-    soft = cv2.GaussianBlur(dist, (0, 0), max(1.0, step * 0.8))
+    soft = cv2.GaussianBlur(dist, (0, 0), max(1.0, s * 0.8))
     soft = soft / max(float(soft.max()), 1e-6)
     xi = np.clip(pts[:, 0].astype(int), 0, mw - 1)
     yi = np.clip(pts[:, 1].astype(int), 0, mh - 1)
-    t = np.clip(soft[yi, xi], 0.0, 1.0)
-    z = np.sqrt(np.clip(1.0 - (1.0 - t) ** 2, 0.0, 1.0))
+    tt = np.clip(soft[yi, xi], 0.0, 1.0)
+    z = np.sqrt(np.clip(1.0 - (1.0 - tt) ** 2, 0.0, 1.0))
     z[is_rim] = 0.0
 
-    # 5. front + mirrored back, sharing the rim points
+    # 5. front + mirrored back, sharing the outline points
     n = len(pts)
     back_id = np.arange(n)
     off = np.nonzero(~is_rim)[0]
@@ -247,9 +271,8 @@ def inflate(alpha, detail=60):
     zs = np.concatenate([z, -z[off]])
     verts = np.column_stack([verts_px, zs])
     uv = np.column_stack([verts_px[:, 0] / w, 1.0 - verts_px[:, 1] / h])
-    back = back_id[tris][:, [0, 2, 1]]                  # reversed: faces -z
-    faces = np.vstack([tris, back])
-    return verts, faces, uv
+    back = back_id[faces][:, ::-1]                      # reversed: faces -z
+    return verts, np.vstack([faces, back]), uv
 
 
 def is_closed(faces):
