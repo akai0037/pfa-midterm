@@ -2,7 +2,11 @@
 
 Programming for Animators midterm, Tong Lin (akai0037).
 
-A Maya tool that turns a 2D illustration into a 3D scene you can animate. You draw a box around each object in the drawing. The tool cuts each object out, paints over the hole it leaves in the background, and builds a camera that matches the drawing with every object at its own distance from the camera. Seen through the camera, the scene looks exactly like the drawing. Move the camera and near objects slide more than far ones (parallax). The objects can be flat cards (2.5D), rounded "inflated" 3D shapes, or real 3D models made by an AI.
+A Maya tool that turns a 2D illustration into a 3D scene you can animate. You draw a box around each object in the drawing. The tool cuts each object out, paints over the hole it leaves in the background, and builds a camera that matches the drawing with every object at its own distance from the camera. Seen through the camera, the scene looks exactly like the drawing. Move the camera and near objects slide more than far ones (parallax). The objects can be flat cards (2.5D), rounded "inflated" 3D shapes made of clean quads, or real 3D models made by an AI.
+
+**The chore it ends:** setting up a background or reference scene from a sketch by hand: modeling simple shapes, placing them at the right depth, and lining them up with a camera so they match the drawing.
+
+**Demo video (1-3 min):** _link coming soon_
 
 **App:** Autodesk Maya (Python tool with its own window). Made for **Windows and Mac**, **Maya 2022 or newer**. Tested on **Maya 2026 and Maya 2027 on Windows** (not on a Mac yet). Not standalone.
 
@@ -12,7 +16,11 @@ A Maya tool that turns a 2D illustration into a 3D scene you can animate. You dr
 
 ## Install (2 minutes)
 
-1. **Get the code.** On this GitHub page click the green **Code** button → **Download ZIP**, then unzip it. (Or `git clone` the repo.) Put the folder somewhere it can stay, e.g. `Documents`. Don't move it later; if you do, repeat step 3.
+1. **Get the code.** Either
+   - `git clone https://github.com/akai0037/pfa-midterm-final.git`, or
+   - on this GitHub page click the green **Code** button → **Download ZIP**, then unzip it (the folder is called `pfa-midterm-final-main`).
+
+   Put the folder somewhere it can stay, e.g. `Documents`. Don't move it later; if you do, repeat step 3.
 2. **Open Maya.**
 3. **Drag `drag_into_maya.py` from the folder into Maya's viewport** (the big 3D view).
    - A **2D>3D** button is added to your current shelf.
@@ -21,12 +29,12 @@ A Maya tool that turns a 2D illustration into a 3D scene you can animate. You dr
    - If a message says to **restart Maya**, do that and click the button again.
    - If it still fails, the message shows the reason. The rest of the tool works without OpenCV (Build Scene uses whole-box cards).
 
-Next time, just click the **2D>3D** shelf button.
+Next time, just click the **2D>3D** shelf button. After updating the code (a new `git pull` or ZIP), drag `drag_into_maya.py` in again or restart Maya, so Maya loads the new version.
 
 > If dragging doesn't work: open **Windows → General Editors → Script Editor**, click the **Python** tab, paste this (change the path to your folder), and press **Ctrl+Enter** (Mac: **Cmd+Enter**):
 > ```python
 > import sys
-> sys.path.insert(0, r"C:/Users/YOURNAME/Documents/pfa-midterm-main")   # Mac: "/Users/YOURNAME/Documents/pfa-midterm-main"
+> sys.path.insert(0, r"C:/Users/YOURNAME/Documents/pfa-midterm-final")   # Mac: "/Users/YOURNAME/Documents/pfa-midterm-final"
 > import illustration_to_scene
 > illustration_to_scene.show()
 > ```
@@ -42,7 +50,7 @@ Start from a new empty scene (**File → New Scene**). The tool builds into the 
 3. Click **Build Scene**. The viewport now looks through `illustration_cam` and shows the drawing.
 4. Press **Play** in the timeline (frames 1-120). The camera drifts sideways and the layers move at different speeds.
 5. Under **Scene settings → Proxies**, try the other options, clicking **Build Scene** after each one:
-   - **Inflated 3D (local)**: every object becomes a rounded 3D shape. To see the depth, switch the viewport to the normal camera (viewport menu **Panels → Perspective → persp**) and orbit around (Alt + left-drag; Mac: Option + left-drag).
+   - **Inflated 3D (local)**: every object becomes a rounded 3D shape made of quads. To see the depth, switch the viewport to the normal camera (viewport menu **Panels → Perspective → persp**) and orbit around (Alt + left-drag; Mac: Option + left-drag). To see the quads, turn on **Shading → Wireframe on Shaded**.
    - **AI 3D models (use generated)**: the tree uses a real AI-made 3D model (included in the folder); the other objects use inflated shapes.
    - **Colored cubes (layout check)**: one colored box per object, to check where everything sits.
 6. Press **Ctrl+Z** once to undo a whole build, or click **Delete Built Scene**.
@@ -60,27 +68,31 @@ Start from a new empty scene (**File → New Scene**). The tool builds into the 
    - to draw a new box inside a big box, start dragging inside a box that is *not* selected
 4. **Object list** (right side):
    - **Name**: double-click to rename. It becomes the Maya object's name.
-   - **Distance**: how far the object is from the camera. Smaller = closer = moves more when the camera moves. **Auto Distance** guesses from the drawing: lower in the picture = closer.
+   - **Distance**: how far the object is from the camera. Smaller = closer = moves more when the camera moves. **Auto Distance** guesses from the drawing: lower in the picture = closer. Changes take effect on the next Build.
    - **Thickness %**: how thick cubes and inflated shapes are (% of the box's shorter side). Changes built objects right away.
 5. **Preview Cutouts** shows what gets cut out of each box. If a box grabs too much, make it tighter.
 6. **Fix a cut-out with the brushes** (row above the picture). Click a box, pick a brush, and paint on the picture:
    - **+ Keep (K)** (green): parts of the object the cut-out missed. Painting outside the box makes the box bigger.
    - **- Remove (R)** (red): things that touch the object but aren't part of it.
-   - **Fill hidden (F)** (yellow): a part of the object that's hidden behind something else. Paint it, or just draw its missing outline; the area it closes off with the object is painted in from the object's own colors.
+   - **Fill hidden (F)** (yellow): a part of the object that's hidden behind something else. Paint it, or just draw its missing outline; the area it closes off with the object is painted in with the object's main color (e.g. a pink UFO's pink, not its outlines or windows).
    - **Boxes (B)** goes back to editing boxes. **Brush** sets the size (`[` and `]` also work).
    - **Undo (Ctrl+Z)** / **Redo (Ctrl+Y** or **Ctrl+Shift+Z)** step through the selected box's strokes (Cmd on a Mac). Inside this window they only undo strokes, not the Maya scene. **Clear Strokes** removes all of them (also undoable).
    - If the preview is showing, it updates after every stroke. Strokes are saved with **Save Boxes**.
    - **Zoom in for details:** mouse wheel zooms around the mouse; drag with the **middle mouse button** (or hold **Space** and drag) to move around; **0** or **Fit** shows the whole picture again.
-7. **Save Boxes** writes `<image name>_boxes.json` next to the image. Next time you load the image, the boxes come back.
-8. **Scene settings:**
+7. **Objects inside objects** (e.g. a window on a UFO): draw a box for each and give the inner one a smaller distance. The inner one becomes its own model, and the outer one stays solid behind it (the covered part is painted in with its main color), so nothing gets a hole punched through it.
+8. **Save Boxes** writes `<image name>_boxes.json` next to the image. Next time you load the image, the boxes come back.
+9. **Scene settings:**
    - **Focal length**: the camera lens. The drawing always lines up through the camera; a wider lens (smaller number) gives stronger parallax.
    - **Nearest / Farthest distance**: the range Auto Distance uses. The background card goes just behind Farthest.
    - **Proxies**: textured cards, colored cubes, inflated 3D, or AI 3D models (see above).
-   - **Cut objects out of their boxes**: off = rectangular cards with the whole box.
-   - **Background card**: the drawing (with objects painted out) behind everything.
+   - **Cut objects out of their boxes**: only for textured cards; off = rectangular cards with the whole box. Inflated and AI models always use the cut-outs.
    - **AI background fill (LaMa, on this computer)**: when you Build, the holes left by the cut-out objects are painted in by an AI model, so the background looks like the drawing continues behind them, as if the objects came out of the picture. Runs on the computer's CPU (about 20-30 seconds per Build; the result is reused until you change the boxes). The first time it asks to install it (~250 MB: onnxruntime + the LaMa model, into your Maya user folder). Off = a quick, blurry fill.
+   - **Background card**: the drawing (with objects painted out) behind everything.
    - **Camera drift**: adds the sideways camera move on frames 1-120. Frame 60 lines up exactly with the drawing.
-9. **Build Scene**. Building again replaces the old build. Ctrl+Z undoes it.
+10. **Build Scene**. Building again replaces the old build. Ctrl+Z undoes it.
+11. **After building:** select an object in the viewport or the Outliner and move, rotate or scale it like any Maya object (its handles sit on the object). Changing Thickness keeps your moves. Pressing **Build Scene** again starts over from the boxes, so finish the boxes first, then adjust in Maya.
+
+> **Tip:** to orbit around the scene, switch to **Panels → Perspective → persp** first. Orbiting while looking through `illustration_cam` moves that camera, and then the scene no longer lines up with the drawing (Build Scene puts it back).
 
 The tool remembers its settings. Everything it makes is saved next to your image, in a folder called `<image name>_its`.
 
@@ -94,29 +106,41 @@ Free GPU time on Hugging Face is limited: without an account it runs out after a
 
 ---
 
-## What works now (Oct 19 checkpoint)
+## What works now
 
 - Window with image panel; draw, select, move, resize and nudge boxes; object list with name, distance and thickness; save/load boxes as JSON
 - Camera matched to the drawing (aspect ratio, film back, render resolution)
-- **Cut-outs:** inside each box, OpenCV GrabCut separates the object from what's around it. Nearer objects win where boxes overlap.
-- **Correction brushes:** keep / remove / fill-hidden strokes fix a cut-out by hand; hidden parts of an object are completed from its own colors
+- **Cut-outs:** inside each box, OpenCV GrabCut separates the object from what's around it. Nearer objects win where boxes overlap; an object fully inside a farther one (a window on a UFO) doesn't punch a hole through it.
+- **Correction brushes:** keep / remove / fill-hidden strokes fix a cut-out by hand; hidden parts are painted in with the object's main color
 - **Background fill:** the cut-out areas are painted over, so nothing shows up twice when the camera moves. With the AI option, LaMa (Carve/LaMa-ONNX, runs locally) paints in background that matches the drawing; without it, a quick OpenCV fill
 - Each object placed at its distance and scaled so it covers its box exactly from the camera
+- **Inflated 3D meshes:** all quads, like a hand-made model: a square grid inside, one ring of quads out to the smoothed outline, puffed up like a balloon, front and back joined into a closed mesh. Thin parts (legs, antennas) get their own smaller quads so they keep their shape. The surface facing the camera shows the drawing's exact colors and gets darker as it turns away, so the shape reads without changing the colors.
 - Four kinds of proxies: textured cards (2.5D), colored cubes, inflated 3D meshes, AI 3D models (TRELLIS / Hunyuan3D-2 online, loaded from .glb)
+- Built objects have their pivot on themselves, so they're easy to move and scale afterwards
 - Camera drift animation to show parallax
 - Whole build is one undo step; settings remembered between sessions
-- Slow or failing parts never crash Maya: the AI runs in a separate process, and anything that fails falls back to a simpler proxy
+- Slow or failing parts never crash Maya: the AI runs in a separate process, and anything that fails falls back to a simpler proxy (and says so in the Script Editor)
 
 ## What doesn't work yet
 
 - **Cut-outs get confused when an object and its surroundings have similar colors.** In the sample, the mountains' cut-out keeps a bit of sky. The brushes fix it by hand; SAM 2 (which understands shapes) should get it right on its own.
-- **Filled-in hidden parts are a smooth guess**: they take the object's nearby colors, so lines and details behind the occluder don't come back.
+- **Filled-in hidden parts are one flat color**: the object's main color, so lines and details behind the thing covering it don't come back.
+- **Inflated shapes are a guess at depth**: every object puffs up the same way (round in the middle, flat at the edge), and the back is a mirror of the front with the same picture on it. Very thin lines (a pixel or two wide) are left out of the mesh.
+- **Rebuilding resets manual changes**: moves and scales done in Maya are lost when you press Build Scene again.
 - **The AI background fill works on a 512 × 512 version of the area around the holes**, so on big pictures the filled-in part is a bit softer than the rest. Without the AI option the fill is blurry.
 - **No automatic detection yet**: you draw every box.
 - **Distances are guessed** (from height in the picture) or typed in. They don't read the drawing's real depth yet.
 - **AI 3D depends on free online GPU time** (see above). The Hunyuan3D-2 textured mode currently errors on their server, so the tool uses its shape-only mode and paints the drawing on. AI models of flat cartoon drawings come out fairly flat, and the back of any 3D shape is a guess.
 - Cut-outs take a few seconds and Maya freezes while they run.
 - Not tested on a Mac yet. The code is written for both (it finds Maya's Python on either system and picks matching OpenCV builds), but nobody has run it on a Mac.
+
+## What I'd build next
+
+- **Automatic detection** (Grounding DINO + SAM 2, as in the feedback on my pitch), so boxes and cut-outs come from the drawing and I only correct them.
+- **Real depth** from Depth Anything instead of guessing from height in the picture, and depth-shaped meshes instead of the same balloon shape for everything.
+- **Keep manual changes** when rebuilding: remember each object's moves and scales and put them back.
+- **Simple animation per object** (bob, sway, spin) from the object list, as in my original pitch.
+- A Mac peer run.
 
 ---
 
@@ -143,7 +167,7 @@ Free GPU time on Hugging Face is limited: without an account it runs out after a
 - `drag_into_maya.py`: installer, drag it into Maya's viewport
 - `illustration_to_scene.py`: the tool (window + scene builder)
 - `its_segment.py`: cuts objects out of their boxes and fills the background (numpy + OpenCV)
-- `its_mesh.py`: turns a cut-out into an inflated 3D mesh
+- `its_mesh.py`: turns a cut-out into an inflated 3D quad mesh
 - `its_ai3d.py`: sends a cut-out to TRELLIS / Hunyuan3D-2 and saves the .glb (runs outside Maya)
 - `its_glb.py`: reads .glb 3D files (Maya can't open them by itself)
 - `its_lama.py`: AI background fill with LaMa (runs outside Maya, on the CPU)
