@@ -336,12 +336,20 @@ class SceneBuilder(object):
         return x, y, -d
 
     # --- shading ------------------------------------------------------------
-    def textured_shader(self, tag, x, y, w, h, path=None, alpha=False):
-        """Lambert that shows only the (x, y, w, h) pixel region of the image.
+    def textured_shader(self, tag, x, y, w, h, path=None, alpha=False, lit=False):
+        """Shader that shows only the (x, y, w, h) pixel region of the image.
         With path= it shows that whole picture instead (x=y=0, w=W, h=H).
-        alpha=True uses the picture's transparency (cut-out objects)."""
-        # unlit surface shader: shows the drawing's colors exactly, and its alpha
-        mtl = cmds.shadingNode("surfaceShader", asShader=True, name=NODE_PREFIX + tag + "_mtl")
+        alpha=True uses the picture's transparency (cut-out objects).
+        lit=True: lit by the scene's lights, so a 3D shape shows its form."""
+        if lit:
+            # Lambert: light and shadow show the bulge. Full diffuse + some ambient keeps
+            # the side facing the camera close to the drawing's colors
+            mtl = cmds.shadingNode("lambert", asShader=True, name=NODE_PREFIX + tag + "_mtl")
+            cmds.setAttr(mtl + ".diffuse", 1.0)
+            cmds.setAttr(mtl + ".ambientColor", 0.35, 0.35, 0.35, type="double3")
+        else:
+            # unlit surface shader: shows the drawing's colors exactly, and its alpha
+            mtl = cmds.shadingNode("surfaceShader", asShader=True, name=NODE_PREFIX + tag + "_mtl")
         sg = cmds.sets(renderable=True, noSurfaceShader=True, empty=True,
                        name=NODE_PREFIX + tag + "_SG")
         cmds.connectAttr(mtl + ".outColor", sg + ".surfaceShader", force=True)
@@ -365,9 +373,14 @@ class SceneBuilder(object):
             cmds.setAttr(p2d + ".repeatUV", w / self.W, h / self.H, type="double2")
             cmds.setAttr(p2d + ".offset", x / self.W, 1.0 - (y + h) / self.H, type="double2")
 
-        cmds.connectAttr(fnode + ".outColor", mtl + ".outColor", force=True)
-        if alpha:
-            cmds.connectAttr(fnode + ".outTransparency", mtl + ".outTransparency", force=True)
+        if lit:
+            cmds.connectAttr(fnode + ".outColor", mtl + ".color", force=True)
+            if alpha:
+                cmds.connectAttr(fnode + ".outTransparency", mtl + ".transparency", force=True)
+        else:
+            cmds.connectAttr(fnode + ".outColor", mtl + ".outColor", force=True)
+            if alpha:
+                cmds.connectAttr(fnode + ".outTransparency", mtl + ".outTransparency", force=True)
         return sg
 
     def cube_shader(self, i, tag):
@@ -515,8 +528,10 @@ class SceneBuilder(object):
         if self.proxy_type in (P_INFLATE, P_AI) and cut:
             # the mesh already has the object's shape, so it's solid (no see-through):
             # its texture is the cut-out with the empty area filled by the object's
-            # edge colors, so the rim doesn't pick up transparent or background pixels
-            sg = self.textured_shader(tag, 0, 0, self.W, self.H, path=bleed_texture(cut), alpha=False)
+            # edge colors, so the rim doesn't pick up transparent or background pixels.
+            # Lit, so the light and shadow show that it's round
+            sg = self.textured_shader(tag, 0, 0, self.W, self.H, path=bleed_texture(cut),
+                                      alpha=False, lit=True)
             node = self.make_inflated(name, b, cut, sg, parent, index=i, thick=thick)
             if node:
                 return node
