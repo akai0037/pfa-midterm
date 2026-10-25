@@ -136,10 +136,10 @@ def cut_object(img, box, iterations=5):
         gc[:2, :] = gc[-2:, :] = cv2.GC_PR_BGD
         gc[:, :2] = gc[:, -2:] = cv2.GC_PR_BGD
     # the user's strokes are certain: they teach GrabCut what is / isn't the object.
-    # Inside a "fill" area GrabCut decides pixel by pixel: whatever still looks like the
-    # object is visible (keeps its real colors), the rest is what covers it (painted in later)
+    # A "fill" area is covered by something else, so what shows there now isn't the
+    # object: GrabCut shouldn't learn its colors, and it all gets painted in later
     gc[remove[y0:y1, x0:x1] > 0] = cv2.GC_BGD
-    gc[fill[y0:y1, x0:x1] > 0] = cv2.GC_PR_FGD
+    gc[fill[y0:y1, x0:x1] > 0] = cv2.GC_PR_BGD
     gc[keep[y0:y1, x0:x1] > 0] = cv2.GC_FGD
 
     bgd = np.zeros((1, 65), np.float64)
@@ -161,6 +161,7 @@ def cut_object(img, box, iterations=5):
     # strokes win over everything (also over hole filling in _clean)
     full = cv2.bitwise_or(full, keep)
     full = cv2.bitwise_and(full, cv2.bitwise_not(remove))
+    full = cv2.bitwise_and(full, cv2.bitwise_not(cv2.bitwise_and(fill, cv2.bitwise_not(keep))))
 
     # a "fill" stroke can just be the outline of the hidden part: whatever it closes
     # off together with the visible object counts as hidden too
@@ -173,27 +174,43 @@ def cut_object(img, box, iterations=5):
     return full, fill
 
 
+def main_color(rgb, known, near, k=4):
+    """The object's main color next to the hidden part: the visible object pixels
+    around it are sorted into k color groups, and the biggest group wins. So outlines,
+    windows and highlights don't leak in; on the UFO this is its pink."""
+    pix = rgb[known & near].reshape(-1, 3).astype(np.float32)
+    if len(pix) < k * 10:
+        pix = rgb[known].reshape(-1, 3).astype(np.float32)
+    if len(pix) < k:
+        return np.median(pix, 0) if len(pix) else np.array([200, 200, 200], np.float32)
+    if len(pix) > 20000:                    # plenty for picking a color, and faster
+        pix = pix[np.random.RandomState(0).choice(len(pix), 20000, replace=False)]
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    cv2.setRNGSeed(0)                       # same answer every time
+    _, labels, centers = cv2.kmeans(pix, k, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+    return centers[np.bincount(labels.ravel(), minlength=k).argmax()]
+
+
 def complete_hidden(rgb, known, fill):
-    """Paint the hidden part of an object (fill) using the object's own colors:
-    every hidden pixel first takes the color of the nearest visible object pixel,
-    then the result is smoothed so it doesn't look streaky."""
+    """Paint the hidden part of an object (fill) in the object's main color, with
+    the seam blended a few pixels into the neighbors so it doesn't look cut out."""
     if not fill.any() or not known.any():
         return rgb
-    # sample colors a few pixels inside the object, not from its anti-aliased edge
-    # (the edge still has a bit of whatever was next to it)
-    inner = cv2.erode(known.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    # look at the visible object within ~30 px of the hidden part, a few pixels in
+    # from its edge (the anti-aliased edge still has a bit of what was next to it)
+    inner = cv2.erode(known.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
     if inner.sum() > 50:
         known = inner
-    unknown = (~known).astype(np.uint8) * 255
-    _, labels = cv2.distanceTransformWithLabels(unknown, cv2.DIST_L2, 5,
-                                                labelType=cv2.DIST_LABEL_PIXEL)
-    ys, xs = np.nonzero(known)
-    lut = np.zeros((labels.max() + 1, 3), np.uint8)
-    lut[labels[ys, xs]] = rgb[ys, xs]
-    base = np.where(known[:, :, None], rgb, lut[labels])
-    smooth = _inpaint(base, fill.astype(np.uint8) * 255)
+    near = cv2.dilate(fill.astype(np.uint8), np.ones((61, 61), np.uint8)) > 0
+    color = main_color(rgb, known, near)
+
     out = rgb.copy()
-    out[fill] = smooth[fill]
+    out[fill] = np.clip(color, 0, 255).astype(np.uint8)
+    # soften only a thin seam where the painted part meets the visible object
+    seam = cv2.dilate(fill.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    blurred = cv2.GaussianBlur(out, (5, 5), 0)
+    edge = seam & ~cv2.erode(fill.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+    out[edge] = blurred[edge]
     return out
 
 
