@@ -203,6 +203,63 @@ def ai_ok():
     return os.path.isdir(os.path.join(AI_DIR, "gradio_client"))
 
 
+# --- AI background fill (LaMa, runs on this computer, outside Maya) ------------
+
+LAMA_DIR = os.path.join(cmds.internalVar(userAppDir=True), "its_lama_packages")
+LAMA_MODEL = os.path.join(cmds.internalVar(userAppDir=True), "its_models", "lama_fp32.onnx")
+LAMA_PACKAGES = ["onnxruntime", "flatbuffers", "protobuf", "packaging",
+                 "coloredlogs", "humanfriendly", "sympy", "mpmath"]
+
+
+def lama_ok():
+    return os.path.isdir(os.path.join(LAMA_DIR, "onnxruntime")) and os.path.isfile(LAMA_MODEL)
+
+
+def _lama_script():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "its_lama.py")
+
+
+def _last_line(res):
+    lines = [l for l in ((res.stdout or "") + (res.stderr or "")).splitlines() if l.strip()]
+    return lines[-1] if lines else "no output"
+
+
+def install_lama():
+    """One-time: onnxruntime (uses Maya's own numpy) + the LaMa model (~200 MB).
+    Returns (ok, message)."""
+    if not os.path.isdir(os.path.join(LAMA_DIR, "onnxruntime")):
+        os.makedirs(LAMA_DIR, exist_ok=True)
+        cmd = [mayapy_path(), "-m", "pip", "install", "--no-deps", "--target", LAMA_DIR] + LAMA_PACKAGES
+        print("[Illustration to 3D] " + " ".join(cmd))
+        res = _run_quietly(cmd)
+        print(res.stdout[-1500:])
+        print(res.stderr[-1500:])
+        if res.returncode != 0:
+            return False, "installing onnxruntime failed: " + _last_line(res)
+    if not os.path.isfile(LAMA_MODEL):
+        res = _run_quietly([mayapy_path(), "-u", _lama_script(), "--download", "--model", LAMA_MODEL])
+        print(res.stdout[-1500:])
+        if not os.path.isfile(LAMA_MODEL):
+            return False, "downloading the model failed: " + _last_line(res)
+    return True, "AI background fill installed."
+
+
+def run_lama(image_path, hole_path, out_path):
+    """Fill the hole with LaMa in a separate process. Returns (ok, message)."""
+    cmd = [mayapy_path(), "-u", _lama_script(), image_path, hole_path, out_path,
+           "--model", LAMA_MODEL, "--site", LAMA_DIR + os.pathsep + SITE_DIR]
+    try:
+        kw = {"creationflags": 0x08000000} if os.name == "nt" else {}
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300, **kw)
+    except subprocess.TimeoutExpired:
+        return False, "LaMa took too long"
+    if res.returncode == 0 and os.path.isfile(out_path):
+        return True, "done"
+    print(res.stdout[-2000:])
+    print(res.stderr[-2000:])
+    return False, _last_line(res).replace("ERROR ", "")
+
+
 def install_ai():
     """One-time install of gradio_client (talks to Hugging Face) into its own folder.
     Only the separate AI process uses it, never Maya itself."""
@@ -687,6 +744,12 @@ class BoxCanvas(QtWidgets.QGraphicsView):
     boxDrawn = QtCore.Signal(QtCore.QRectF)
     boxClicked = QtCore.Signal(int)
     boxEdited = QtCore.Signal(int)
+    strokeAdded = QtCore.Signal(int, object)   # box index, stroke dict
+    hint = QtCore.Signal(str)
+    zoomChanged = QtCore.Signal(float)          # 1.0 = whole picture fits
+
+    # brush colors: keep = green, remove = red, fill hidden = yellow
+    BRUSH_COLORS = {"keep": (80, 220, 110), "remove": (255, 70, 70), "fill": (255, 205, 50)}
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -703,7 +766,18 @@ class BoxCanvas(QtWidgets.QGraphicsView):
         self.cut_items = []
         self._selected = -1
         self._edit = None          # (box index, mode, start point, original box)
+        self.brush_mode = None     # None = edit boxes, or "keep" / "remove" / "fill"
+        self.brush_r = 10          # brush radius in image pixels
+        self._stroke = None        # (box index, [points]) while painting
+        self._stroke_item = None
+        self._cursor_item = None
         self.setMouseTracking(True)
+        # zoom / pan: wheel zooms around the mouse, middle-drag or Space+drag pans
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.NoAnchor)
+        self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorViewCenter)
+        self._zoomed = False
+        self._pan_from = None
+        self._space = False
         self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self._start = None
         self._temp = None
@@ -713,6 +787,7 @@ class BoxCanvas(QtWidgets.QGraphicsView):
     def show_placeholder(self):
         self._scene.clear()
         self.pix_item, self.overlay, self._temp, self.cut_items = None, [], None, []
+        self._stroke_item = self._cursor_item = None
         t = self._scene.addText("Click  Load Image  to start.\n\n"
                                 "Then drag on the picture to draw a box\n"
                                 "around each object.")
@@ -725,18 +800,78 @@ class BoxCanvas(QtWidgets.QGraphicsView):
             return None
         self._scene.clear()
         self.overlay, self._temp, self.cut_items = [], None, []
+        self._stroke_item = self._cursor_item = None
         self.pix_item = self._scene.addPixmap(pm)
         self._scene.setSceneRect(QtCore.QRectF(pm.rect()))
         self.fit()
         return pm.width(), pm.height()
 
     def fit(self):
+        """Show the whole picture."""
         if self.pix_item:
             self.fitInView(self.pix_item, QtCore.Qt.KeepAspectRatio)
+            self._zoomed = False
+            self._after_zoom()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self.fit()
+        if not self._zoomed:
+            self.fit()
+
+    # --- zoom / pan --------------------------------------------------------
+    MAX_ZOOM = 40.0        # times the "whole picture" size
+
+    def _fit_scale(self):
+        if self.pix_item is None:
+            return 1.0
+        v, r = self.viewport().rect(), self.pix_item.boundingRect()
+        return max(1e-6, min(v.width() / max(r.width(), 1), v.height() / max(r.height(), 1)))
+
+    def zoom_by(self, factor, anchor=None):
+        """Zoom, keeping the picture point under `anchor` (a viewport position;
+        default: the middle of the view) in the same place on screen."""
+        if self.pix_item is None:
+            return
+        cur, fit = self.transform().m11(), self._fit_scale()
+        new = min(max(cur * factor, fit), fit * self.MAX_ZOOM)
+        if new <= fit * 1.001:
+            self.fit()
+            return
+        if anchor is None:
+            anchor = self.viewport().rect().center()
+        target = self.mapToScene(anchor)
+        self.setTransformationAnchor(QtWidgets.QGraphicsView.NoAnchor)
+        self.scale(new / cur, new / cur)
+        drift = self.mapFromScene(target) - anchor
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + drift.x())
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + drift.y())
+        self._zoomed = True
+        self._after_zoom()
+
+    def _after_zoom(self):
+        self.zoomChanged.emit(self.transform().m11() / self._fit_scale())
+        if self.pix_item is not None and self._boxes:
+            self.draw_boxes(self._boxes, self._selected)     # handles keep their screen size
+
+    def wheelEvent(self, event):
+        if self.pix_item is None:
+            return super().wheelEvent(event)
+        steps = event.angleDelta().y() / 120.0
+        if steps:
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            self.zoom_by(1.2 ** steps, anchor=pos)
+        event.accept()
+
+    def _start_pan(self, event):
+        self._pan_from = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        self.viewport().setCursor(QtCore.Qt.ClosedHandCursor)
+
+    def _pan(self, event):
+        p = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        d = p - self._pan_from
+        self._pan_from = p
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - d.x())
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() - d.y())
 
     # --- mouse -----------------------------------------------------------
     def _img_pos(self, event):
@@ -809,11 +944,67 @@ class BoxCanvas(QtWidgets.QGraphicsView):
         b["x"], b["y"] = int(round(x0)), int(round(y0))
         b["w"], b["h"] = int(round(x1 - x0)), int(round(y1 - y0))
 
+    # --- brush (keep / remove / fill hidden) -------------------------------
+    def set_brush(self, mode):
+        self.brush_mode = mode
+        if self._cursor_item is not None:
+            self._scene.removeItem(self._cursor_item)
+            self._cursor_item = None
+        self.viewport().setCursor(QtCore.Qt.CrossCursor)
+
+    def _brush_pen(self, mode, alpha=150):
+        c = QtGui.QColor(*self.BRUSH_COLORS[mode])
+        c.setAlpha(alpha)
+        pen = QtGui.QPen(c, self.brush_r * 2.0)
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.RoundJoin)
+        return pen
+
+    @staticmethod
+    def _path(pts):
+        path = QtGui.QPainterPath(QtCore.QPointF(*pts[0]))
+        if len(pts) == 1:
+            path.lineTo(pts[0][0] + 0.01, pts[0][1])
+        for x, y in pts[1:]:
+            path.lineTo(x, y)
+        return path
+
+    def _show_brush_cursor(self, p):
+        r = self.brush_r
+        if self._cursor_item is None:
+            pen = QtGui.QPen(QtGui.QColor(*self.BRUSH_COLORS[self.brush_mode]), 1.5)
+            pen.setCosmetic(True)
+            self._cursor_item = self._scene.addEllipse(0, 0, 1, 1, pen)
+            self._cursor_item.setZValue(6)
+        self._cursor_item.setRect(p.x() - r, p.y() - r, 2 * r, 2 * r)
+
+    def _brush_press(self, p):
+        i = self._box_at(p)
+        if i is not None and i != self._selected:
+            self.boxClicked.emit(i)            # painting on another box selects it
+        elif i is None:
+            i = self._selected
+        if not (0 <= i < len(self._boxes)):
+            self.hint.emit("Click a box first, then paint on it.")
+            return
+        self._stroke = (i, [(round(p.x(), 1), round(p.y(), 1))])
+        self._stroke_item = self._scene.addPath(self._path(self._stroke[1]),
+                                                self._brush_pen(self.brush_mode))
+        self._stroke_item.setZValue(5)
+
     def mousePressEvent(self, event):
+        if self.pix_item is not None and (event.button() == QtCore.Qt.MiddleButton or
+                                          (event.button() == QtCore.Qt.LeftButton and self._space)):
+            self.setFocus()
+            self._start_pan(event)
+            return
         if self.pix_item is None or event.button() != QtCore.Qt.LeftButton:
             return super().mousePressEvent(event)
         self.setFocus()
         p = self._img_pos(event)
+        if self.brush_mode:
+            self._brush_press(p)
+            return
         mode = self._hit(self._selected, p)
         if mode:   # grab the selected box
             self._edit = (self._selected, mode, p, dict(self._boxes[self._selected]))
@@ -827,7 +1018,21 @@ class BoxCanvas(QtWidgets.QGraphicsView):
     def mouseMoveEvent(self, event):
         if self.pix_item is None:
             return super().mouseMoveEvent(event)
+        if self._pan_from is not None:
+            self._pan(event)
+            return
+        if self._space:
+            return
         p = self._img_pos(event)
+        if self.brush_mode:
+            self._show_brush_cursor(p)
+            if self._stroke is not None:
+                pts = self._stroke[1]
+                lx, ly = pts[-1]
+                if (p.x() - lx) ** 2 + (p.y() - ly) ** 2 >= (self.brush_r * 0.35) ** 2:
+                    pts.append((round(p.x(), 1), round(p.y(), 1)))
+                    self._stroke_item.setPath(self._path(pts))
+            return super().mouseMoveEvent(event)
         if self._edit is not None:
             self._apply_edit(p)
             self.draw_boxes(self._boxes, self._selected)
@@ -839,6 +1044,19 @@ class BoxCanvas(QtWidgets.QGraphicsView):
         return super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._pan_from is not None:
+            self._pan_from = None
+            self.viewport().setCursor(QtCore.Qt.OpenHandCursor if self._space else QtCore.Qt.CrossCursor)
+            return
+        if self._stroke is not None:
+            i, pts = self._stroke
+            self._stroke = None
+            if self._stroke_item is not None:
+                self._scene.removeItem(self._stroke_item)
+                self._stroke_item = None
+            self.strokeAdded.emit(i, {"mode": self.brush_mode, "r": round(self.brush_r, 1),
+                                      "pts": [list(q) for q in pts]})
+            return
         if self._edit is not None:
             i, mode, start, o = self._edit
             self._edit = None
@@ -857,7 +1075,36 @@ class BoxCanvas(QtWidgets.QGraphicsView):
             if i is not None:
                 self.boxClicked.emit(i)
 
+    def leaveEvent(self, event):
+        if self._cursor_item is not None:
+            self._scene.removeItem(self._cursor_item)
+            self._cursor_item = None
+        super().leaveEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Space and not event.isAutoRepeat():
+            self._space = False
+            if self._pan_from is None:
+                self.viewport().setCursor(QtCore.Qt.CrossCursor)
+            return
+        super().keyReleaseEvent(event)
+
     def keyPressEvent(self, event):
+        if event.key() == QtCore.Qt.Key_Space:
+            if not event.isAutoRepeat():
+                self._space = True
+                if self._cursor_item is not None:
+                    self._scene.removeItem(self._cursor_item)
+                    self._cursor_item = None
+                self.viewport().setCursor(QtCore.Qt.OpenHandCursor)
+            return
+        zoom_keys = {QtCore.Qt.Key_Plus: 1.25, QtCore.Qt.Key_Equal: 1.25, QtCore.Qt.Key_Minus: 0.8}
+        if event.key() in zoom_keys and not event.modifiers() & QtCore.Qt.ControlModifier:
+            self.zoom_by(zoom_keys[event.key()])
+            return
+        if event.key() in (QtCore.Qt.Key_0, QtCore.Qt.Key_Home):
+            self.fit()
+            return
         arrows = {QtCore.Qt.Key_Left: (-1, 0), QtCore.Qt.Key_Right: (1, 0),
                   QtCore.Qt.Key_Up: (0, -1), QtCore.Qt.Key_Down: (0, 1)}
         if event.key() in arrows and 0 <= self._selected < len(self._boxes) and self.pix_item:
@@ -922,8 +1169,9 @@ class BoxCanvas(QtWidgets.QGraphicsView):
         if self.pix_item is None:
             return
         size = max(12, int(self.pix_item.boundingRect().width() / 55))
+        zoom = max(1.0, self.transform().m11() / self._fit_scale())   # labels keep their size on screen
         font = QtGui.QFont()
-        font.setPixelSize(size)
+        font.setPixelSize(max(3, int(round(size / zoom))))
         font.setBold(True)
         for i, b in enumerate(boxes):
             sel = (i == selected)
@@ -942,6 +1190,16 @@ class BoxCanvas(QtWidgets.QGraphicsView):
             label.setZValue(2)
             bg.setZValue(1)
             self.overlay += [r, bg, label]
+            if sel:   # its correction strokes
+                for st in b.get("strokes") or []:
+                    if not st.get("pts") or st.get("mode") not in self.BRUSH_COLORS:
+                        continue
+                    keep_r = self.brush_r
+                    self.brush_r = st.get("r", 10)
+                    item = self._scene.addPath(self._path(st["pts"]), self._brush_pen(st["mode"], 110))
+                    self.brush_r = keep_r
+                    item.setZValue(1.5)
+                    self.overlay.append(item)
             if sel:   # corner + edge handles on the selected box
                 hs = self._tol() * 1.1
                 hpen = QtGui.QPen(QtGui.QColor(40, 40, 40), 1)
@@ -973,10 +1231,12 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self.img_w = self.img_h = 0
         self.boxes = []          # dicts: name, x, y, w, h, dist
         self.manifest = None     # cut-out results for the current boxes
+        self._history = {}       # per box: {"undo": [...], "redo": [...]} snapshots of its strokes + size
         self._syncing = False
 
         self._build_ui()
         self._load_prefs()
+        QtWidgets.QApplication.instance().installEventFilter(self)
         self.status("Load an illustration to start.")
 
     # --- layout ------------------------------------------------------------
@@ -995,6 +1255,69 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         top.addSpacing(10)
         top.addWidget(self.lbl_image, 1)
         main.addLayout(top)
+
+        # mouse mode: edit boxes, or paint corrections onto the selected box's cut-out
+        tools = QtWidgets.QHBoxLayout()
+        tools.addWidget(QtWidgets.QLabel("Mouse:"))
+        self.mode_group = QtWidgets.QButtonGroup(self)
+        self.mode_buttons = {}
+        for key, label, tip, color in (
+                (None, "Boxes (B)", "Draw, select, move and resize boxes.", None),
+                ("keep", "+ Keep (K)", "Paint parts that belong to the object but were missed.\n"
+                                       "Painting outside the box makes the box bigger.", "#50dc6e"),
+                ("remove", "- Remove (R)", "Paint parts that touch the object but aren't part of it.", "#ff4646"),
+                ("fill", "Fill hidden (F)", "Paint (or just outline) a part of the object that is hidden\n"
+                                            "behind something else. It gets painted in from the\n"
+                                            "object's own colors.", "#ffcd32")):
+            btn = QtWidgets.QPushButton(label)
+            btn.setCheckable(True)
+            btn.setToolTip(tip)
+            # full style (border + padding too), otherwise Maya's own button style wins
+            btn.setStyleSheet(
+                "QPushButton{padding:4px 10px;}"
+                "QPushButton:checked{background-color:%s;color:%s;border:1px solid #1d1d1d;"
+                "border-radius:3px;font-weight:bold;}" % (color or "#5a7bb0", "black" if color else "white"))
+            fm = btn.fontMetrics()
+            btn.setMinimumWidth(fm.horizontalAdvance(label) + 30 if hasattr(fm, "horizontalAdvance")
+                                else fm.width(label) + 30)
+            self.mode_group.addButton(btn)
+            self.mode_buttons[key] = btn
+            tools.addWidget(btn)
+        self.mode_buttons[None].setChecked(True)
+        tools.addSpacing(12)
+        tools.addWidget(QtWidgets.QLabel("Brush"))
+        self.sp_brush = QtWidgets.QSpinBox()
+        self.sp_brush.setRange(1, 300)
+        self.sp_brush.setValue(10)
+        self.sp_brush.setSuffix(" px")
+        self.sp_brush.setToolTip("Brush radius in image pixels ( [ and ] change it )")
+        tools.addWidget(self.sp_brush)
+        mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
+        self.btn_undo_stroke = QtWidgets.QPushButton("Undo (%s+Z)" % mod)
+        self.btn_undo_stroke.setToolTip("Undo the last stroke change on the selected box")
+        self.btn_redo_stroke = QtWidgets.QPushButton("Redo (%s+Y)" % mod)
+        self.btn_redo_stroke.setToolTip("Redo it (%s+Y or %s+Shift+Z)" % (mod, mod))
+        self.btn_clear_strokes = QtWidgets.QPushButton("Clear Strokes")
+        self.btn_clear_strokes.setToolTip("Remove all correction strokes from the selected box "
+                                          "(can be undone)")
+        tools.addWidget(self.btn_undo_stroke)
+        tools.addWidget(self.btn_redo_stroke)
+        tools.addWidget(self.btn_clear_strokes)
+        tools.addSpacing(12)
+        self.lbl_zoom = QtWidgets.QLabel("100%")
+        self.lbl_zoom.setToolTip("Mouse wheel: zoom (around the mouse)\n"
+                                 "Middle-drag or Space + drag: move around\n"
+                                 "+ / - : zoom,  0 : whole picture")
+        self.lbl_zoom.setMinimumWidth(48)
+        self.btn_fit = QtWidgets.QPushButton("Fit (0)")
+        self.btn_fit.setToolTip("Show the whole picture")
+        tools.addWidget(self.lbl_zoom)
+        tools.addWidget(self.btn_fit)
+        tools.addStretch(1)
+        main.addLayout(tools)
+        for b in list(self.mode_buttons.values()) + [self.btn_undo_stroke, self.btn_redo_stroke,
+                                                     self.btn_clear_strokes, self.btn_fit]:
+            b.setFocusPolicy(QtCore.Qt.NoFocus)
 
         split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.canvas = BoxCanvas()
@@ -1067,6 +1390,13 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         fl.addRow("Farthest distance", self.sp_far)
         fl.addRow("Proxies", self.cb_proxy)
         fl.addRow(self.chk_cut)
+        self.chk_lama = QtWidgets.QCheckBox("AI background fill (LaMa, on this computer)")
+        self.chk_lama.setToolTip(
+            "When you Build, the holes left by cut-out objects are painted in by an AI model\n"
+            "(LaMa) so the background looks like the drawing, as if the objects came out of it.\n"
+            "Runs on this computer in a few seconds. First time: installs ~250 MB.\n"
+            "Off: a quick blurry fill.")
+        fl.addRow(self.chk_lama)
         fl.addRow(self.chk_bg)
         fl.addRow(self.chk_drift)
         rl.addWidget(set_box)
@@ -1103,6 +1433,16 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self.canvas.boxDrawn.connect(self.add_box)
         self.canvas.boxClicked.connect(self.select_row)
         self.canvas.boxEdited.connect(self._on_box_edited)
+        self.canvas.strokeAdded.connect(self._on_stroke)
+        self.canvas.zoomChanged.connect(lambda z: self.lbl_zoom.setText("%d%%" % round(z * 100)))
+        self.btn_fit.clicked.connect(self.canvas.fit)
+        self.canvas.hint.connect(lambda t: self.status(t, error=True))
+        for key, btn in self.mode_buttons.items():
+            btn.clicked.connect(lambda checked=False, k=key: self.set_mouse_mode(k))
+        self.sp_brush.valueChanged.connect(self._on_brush_size)
+        self.btn_undo_stroke.clicked.connect(self.undo_stroke)
+        self.btn_redo_stroke.clicked.connect(self.redo_stroke)
+        self.btn_clear_strokes.clicked.connect(self.clear_strokes)
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.itemSelectionChanged.connect(self._on_selection)
 
@@ -1121,9 +1461,11 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self.chk_bg.setChecked(bool(_pref("bg", 1)))
         self.chk_drift.setChecked(bool(_pref("drift", 1)))
         self.chk_cut.setChecked(bool(_pref("cut", 1)))
+        self.chk_lama.setChecked(bool(_pref("lama", 1)))
 
     def _save_prefs(self):
         _set_pref("cut", self.chk_cut.isChecked())
+        _set_pref("lama", self.chk_lama.isChecked())
         _set_pref("focal", float(self.sp_focal.value()))
         _set_pref("near", float(self.sp_near.value()))
         _set_pref("far", float(self.sp_far.value()))
@@ -1132,6 +1474,10 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         _set_pref("drift", self.chk_drift.isChecked())
 
     def closeEvent(self, event):
+        try:
+            QtWidgets.QApplication.instance().removeEventFilter(self)
+        except Exception:
+            pass
         self._save_prefs()
         super().closeEvent(event)
 
@@ -1150,6 +1496,8 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self.image_path = path.replace("\\", "/")
         self.img_w, self.img_h = size
         self.boxes = []
+        self._history = {}
+        self.sp_brush.setValue(max(3, int(min(size) / 60)))   # a sensible brush for this picture
         _set_pref("lastDir", os.path.dirname(path))
         self.lbl_image.setText("%s   (%d x %d)" % (os.path.basename(path), self.img_w, self.img_h))
         sidecar = boxes_json_path(path)
@@ -1185,6 +1533,26 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             self.status("Box deleted.")
 
     def keyPressEvent(self, event):
+        action = self._undo_redo_key(event)
+        if action == "undo":
+            self.undo_stroke()
+            return
+        if action == "redo":
+            self.redo_stroke()
+            return
+        editing = self.table.state() == QtWidgets.QAbstractItemView.EditingState
+        if not editing and not event.modifiers() & (QtCore.Qt.ControlModifier | QtCore.Qt.MetaModifier):
+            keys = {QtCore.Qt.Key_B: None, QtCore.Qt.Key_K: "keep",
+                    QtCore.Qt.Key_R: "remove", QtCore.Qt.Key_F: "fill"}
+            if event.key() in keys:
+                self.set_mouse_mode(keys[event.key()])
+                return
+            if event.key() == QtCore.Qt.Key_BracketLeft:
+                self.sp_brush.setValue(max(1, int(self.sp_brush.value() * 0.8)))
+                return
+            if event.key() == QtCore.Qt.Key_BracketRight:
+                self.sp_brush.setValue(int(self.sp_brush.value() * 1.25) + 1)
+                return
         if event.key() in (QtCore.Qt.Key_Delete, QtCore.Qt.Key_Backspace) and \
                 self.table.state() != QtWidgets.QAbstractItemView.EditingState:
             self.delete_selected()
@@ -1203,6 +1571,136 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             b["dist"] = self.auto_distance(b)
         self.refresh(selected=self.table.currentRow())
         self.status("Distances guessed from where each box sits in the drawing.")
+
+    # --- correction brushes ----------------------------------------------------
+    BRUSH_HELP = {
+        None: "Boxes: drag to draw a box, click a box to select it, drag it to move or resize.",
+        "keep": "Keep: paint parts of the selected object that the cut-out missed.",
+        "remove": "Remove: paint things that touch the selected object but aren't part of it.",
+        "fill": "Fill hidden: paint, or just draw the outline of, the part of the object that's "
+                "hidden behind something. It's painted in from the object's own colors.",
+    }
+
+    def set_mouse_mode(self, mode):
+        self.mode_buttons[mode].setChecked(True)
+        self.canvas.set_brush(mode)
+        self.status(self.BRUSH_HELP[mode])
+
+    def _on_brush_size(self, v):
+        self.canvas.brush_r = float(v)
+
+    def _on_stroke(self, i, stroke):
+        if not (0 <= i < len(self.boxes)):
+            return
+        b = self.boxes[i]
+        self._remember(b)
+        b.setdefault("strokes", []).append(stroke)
+        if stroke["mode"] in ("keep", "fill"):
+            self._grow_box_to(b, stroke)
+        self._after_strokes_changed(i, "%s stroke added to '%s'" % (stroke["mode"].capitalize(), b["name"]))
+
+    def _grow_box_to(self, b, stroke):
+        """Keep / fill strokes outside the box make the box bigger, so the card covers them."""
+        r = stroke["r"]
+        xs = [q[0] for q in stroke["pts"]]
+        ys = [q[1] for q in stroke["pts"]]
+        x0 = max(0, min(b["x"], int(min(xs) - r)))
+        y0 = max(0, min(b["y"], int(min(ys) - r)))
+        x1 = min(self.img_w, max(b["x"] + b["w"], int(max(xs) + r + 1)))
+        y1 = min(self.img_h, max(b["y"] + b["h"], int(max(ys) + r + 1)))
+        b["x"], b["y"], b["w"], b["h"] = x0, y0, x1 - x0, y1 - y0
+
+    def _after_strokes_changed(self, i, msg):
+        had_preview = self.manifest is not None
+        self._invalidate_cutouts()
+        self.canvas.draw_boxes(self.boxes, i)
+        if had_preview and opencv_ok():
+            self.preview_cutouts()            # show the corrected cut-out right away
+            self.status(msg + " - preview updated.")
+        else:
+            self.status(msg + ". Click Preview Cutouts to see the result.")
+
+    def _selected_box(self):
+        r = self.table.currentRow()
+        return r if 0 <= r < len(self.boxes) else -1
+
+    # --- stroke undo / redo (per box; also undoes the box growing from a stroke) ---
+    @staticmethod
+    def _snapshot(b):
+        return {"strokes": [dict(st, pts=[list(q) for q in st["pts"]]) for st in b.get("strokes") or []],
+                "rect": (b["x"], b["y"], b["w"], b["h"])}
+
+    @staticmethod
+    def _restore(b, snap):
+        b["strokes"] = snap["strokes"]
+        b["x"], b["y"], b["w"], b["h"] = snap["rect"]
+
+    def _hist(self, b):
+        return self._history.setdefault(id(b), {"undo": [], "redo": []})
+
+    def _remember(self, b):
+        """Call before changing a box's strokes."""
+        h = self._hist(b)
+        h["undo"].append(self._snapshot(b))
+        del h["undo"][:-100]          # keep the last 100 steps
+        h["redo"] = []
+
+    def undo_stroke(self):
+        i = self._selected_box()
+        h = self._hist(self.boxes[i]) if i >= 0 else None
+        if not h or not h["undo"]:
+            self.status("Nothing to undo on the selected box.", error=True)
+            return
+        b = self.boxes[i]
+        h["redo"].append(self._snapshot(b))
+        self._restore(b, h["undo"].pop())
+        self._after_strokes_changed(i, "Undone (%d more step%s to undo)" %
+                                    (len(h["undo"]), "" if len(h["undo"]) == 1 else "s"))
+
+    def redo_stroke(self):
+        i = self._selected_box()
+        h = self._hist(self.boxes[i]) if i >= 0 else None
+        if not h or not h["redo"]:
+            self.status("Nothing to redo on the selected box.", error=True)
+            return
+        b = self.boxes[i]
+        h["undo"].append(self._snapshot(b))
+        self._restore(b, h["redo"].pop())
+        self._after_strokes_changed(i, "Redone (%d more step%s to redo)" %
+                                    (len(h["redo"]), "" if len(h["redo"]) == 1 else "s"))
+
+    def clear_strokes(self):
+        i = self._selected_box()
+        if i < 0 or not self.boxes[i].get("strokes"):
+            self.status("The selected box has no strokes.", error=True)
+            return
+        self._remember(self.boxes[i])
+        self.boxes[i]["strokes"] = []
+        self._after_strokes_changed(i, "All strokes removed from '%s' (%s+Z brings them back)" %
+                                    (self.boxes[i]["name"], "Cmd" if sys.platform == "darwin" else "Ctrl"))
+
+    # Ctrl+Z / Ctrl+Y inside this window undo strokes, not the Maya scene
+    def _undo_redo_key(self, event):
+        if self.table.state() == QtWidgets.QAbstractItemView.EditingState:
+            return None                    # typing a name: let the text box have its own undo
+        mods = event.modifiers()
+        ctrl = bool(mods & (QtCore.Qt.ControlModifier | QtCore.Qt.MetaModifier))
+        if not ctrl:
+            return None
+        if event.key() == QtCore.Qt.Key_Z:
+            return "redo" if mods & QtCore.Qt.ShiftModifier else "undo"
+        if event.key() == QtCore.Qt.Key_Y:
+            return "redo"
+        return None
+
+    def eventFilter(self, obj, event):
+        # Claim Ctrl+Z / Ctrl+Y for this window before Maya's own hotkeys take them
+        # (Maya would undo the scene instead). Only for widgets inside this window.
+        if event.type() == QtCore.QEvent.ShortcutOverride and isinstance(obj, QtWidgets.QWidget) \
+                and (obj is self or self.isAncestorOf(obj)) and self._undo_redo_key(event):
+            event.accept()
+            return True
+        return super().eventFilter(obj, event)
 
     def select_row(self, i):
         self.table.selectRow(i)
@@ -1255,6 +1753,10 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             nb["dist"] = float(b["dist"]) if "dist" in b else self.auto_distance(nb)
             if "thick" in b:
                 nb["thick"] = float(b["thick"])
+            if b.get("strokes"):
+                nb["strokes"] = [{"mode": st["mode"], "r": float(st["r"]) * (sx + sy) / 2.0,
+                                  "pts": [[q[0] * sx, q[1] * sy] for q in st["pts"]]}
+                                 for st in b["strokes"]]
             boxes.append(nb)
         self.boxes = boxes
         self.refresh()
@@ -1292,6 +1794,48 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
         return self.manifest
+
+    def ai_background(self, manifest):
+        """Repaint the background holes with LaMa (once per cut-out run).
+        Changes manifest["background"] to the new file; on any problem keeps the quick fill."""
+        if not manifest or manifest.get("ai_background_done"):
+            return
+        hole = os.path.join(manifest["dir"], "background_hole.png")
+        if not os.path.isfile(hole):
+            return
+        if not lama_ok():
+            ok = QtWidgets.QMessageBox.question(
+                self, "AI background fill",
+                "Painting in the background behind cut-out objects uses an AI model (LaMa) "
+                "that runs on this computer.\n\nInstall it now? (one time, ~250 MB download, "
+                "1-3 minutes; Maya waits meanwhile)\n\nNo = use the quick fill (you can turn "
+                "the option off under Scene settings).")
+            if ok != QtWidgets.QMessageBox.Yes:
+                self.chk_lama.setChecked(False)
+                return
+            self.status("Installing the AI background fill (one time, ~250 MB)... Maya will wait.")
+            QtWidgets.QApplication.processEvents()
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+            try:
+                done, msg = install_lama()
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+            if not done:
+                self.status("AI background fill not installed (%s). Using the quick fill." % msg, error=True)
+                return
+        self.status("Painting the background with AI (LaMa)... a few seconds.")
+        QtWidgets.QApplication.processEvents()
+        out = os.path.join(manifest["dir"], "background_ai.png")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            done, msg = run_lama(self.image_path, hole, out)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if done:
+            manifest["background"] = "background_ai.png"
+            manifest["ai_background_done"] = True
+        else:
+            self.status("AI background fill failed (%s). Using the quick fill." % msg, error=True)
 
     def preview_cutouts(self):
         if not opencv_ok():
@@ -1440,6 +1984,12 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
     def refresh(self, selected=-1):
         self._invalidate_cutouts()
         self._syncing = True
+        # hide the old number boxes right away (Qt only deletes them a moment later)
+        for row in range(self.table.rowCount()):
+            for col in (1, 2):
+                old = self.table.cellWidget(row, col)
+                if old is not None:
+                    old.hide()
         self.table.setRowCount(len(self.boxes))
         for i, b in enumerate(self.boxes):
             self.table.setItem(i, 0, QtWidgets.QTableWidgetItem(b["name"]))
@@ -1499,6 +2049,8 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             if opencv_ok():
                 try:
                     cutouts = self.manifest or self.run_cutouts()
+                    if cutouts and self.chk_lama.isChecked() and self.chk_bg.isChecked():
+                        self.ai_background(cutouts)
                 except Exception as e:
                     traceback.print_exc()
                     self.status("Cut-out failed (%s), building with plain boxes." % e, error=True)

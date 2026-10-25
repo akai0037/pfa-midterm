@@ -7,6 +7,8 @@ Maya needed, so it can also run outside Maya.
 For every box:
   * GrabCut uses the box as a hint ("the object is somewhere in here") and
     separates the object from what's around it.
+  * Optional brush strokes on the box correct it: keep (always the object),
+    remove (never the object) and fill (hidden behind something; painted in).
   * Holes inside the object are filled (e.g. a house's windows stay).
   * Pixels that belong to a NEARER object are removed, so a far object
     doesn't carry a copy of whatever stands in front of it.
@@ -80,13 +82,45 @@ def _clean(mask):
     return _fill_holes(mask)
 
 
+def stroke_mask(shape, strokes, mode):
+    """0/255 mask of the brush strokes of one kind ("keep", "remove" or "fill")."""
+    m = np.zeros(shape[:2], np.uint8)
+    for st in strokes or []:
+        if st.get("mode") != mode:
+            continue
+        r = max(1, int(round(st.get("r", 10))))
+        pts = [(int(round(px)), int(round(py))) for px, py in st.get("pts", [])]
+        for a, b in zip(pts, pts[1:]):
+            cv2.line(m, a, b, 255, 2 * r)
+        for p in pts:                       # round ends and joints
+            cv2.circle(m, p, r, 255, -1)
+    return m
+
+
 def cut_object(img, box, iterations=5):
-    """Full-image 0/255 mask of the object inside box (x, y, w, h)."""
+    """Mask of the object inside box (x, y, w, h), plus the "fill hidden" area.
+
+    The box can carry brush strokes (box["strokes"]) that correct GrabCut:
+      keep   - always part of the object (things GrabCut missed)
+      remove - never part of the object (things that touch it but aren't it)
+      fill   - part of the object that's hidden behind something else;
+               it gets painted in from the object's own colors later
+    Returns (mask, fill) as full-image 0/255 masks; mask doesn't include fill.
+    """
     H, W = img.shape[:2]
     x = int(max(0, min(box["x"], W - 1)))
     y = int(max(0, min(box["y"], H - 1)))
     w = int(max(2, min(box["w"], W - x)))
     h = int(max(2, min(box["h"], H - y)))
+    strokes = box.get("strokes") or []
+    keep = stroke_mask(img.shape, strokes, "keep")
+    remove = stroke_mask(img.shape, strokes, "remove")
+    fill = stroke_mask(img.shape, strokes, "fill")
+    inside_full = np.zeros((H, W), np.uint8)
+    inside_full[y:y + h, x:x + w] = 255
+    keep = cv2.bitwise_and(keep, inside_full)
+    fill = cv2.bitwise_and(fill, inside_full)
+    remove = cv2.bitwise_and(remove, cv2.bitwise_not(fill))   # where they overlap, "hidden part" wins
 
     # work on the box plus some margin (faster, and gives GrabCut background samples)
     pad = int(0.15 * max(w, h)) + 10
@@ -101,6 +135,12 @@ def cut_object(img, box, iterations=5):
         # box covers the whole picture: treat its rim as probably-background
         gc[:2, :] = gc[-2:, :] = cv2.GC_PR_BGD
         gc[:, :2] = gc[:, -2:] = cv2.GC_PR_BGD
+    # the user's strokes are certain: they teach GrabCut what is / isn't the object.
+    # Inside a "fill" area GrabCut decides pixel by pixel: whatever still looks like the
+    # object is visible (keeps its real colors), the rest is what covers it (painted in later)
+    gc[remove[y0:y1, x0:x1] > 0] = cv2.GC_BGD
+    gc[fill[y0:y1, x0:x1] > 0] = cv2.GC_PR_FGD
+    gc[keep[y0:y1, x0:x1] > 0] = cv2.GC_FGD
 
     bgd = np.zeros((1, 65), np.float64)
     fgd = np.zeros((1, 65), np.float64)
@@ -111,16 +151,50 @@ def cut_object(img, box, iterations=5):
         fg = np.zeros(crop.shape[:2], np.uint8)
 
     # only keep what's inside the box (the card only covers the box)
-    inside = np.zeros_like(fg)
-    inside[ry:ry + h, rx:rx + w] = 255
-    fg = _clean(cv2.bitwise_and(fg, inside))
+    fg = _clean(cv2.bitwise_and(fg, inside_full[y0:y1, x0:x1]))
 
     full = np.zeros((H, W), np.uint8)
     full[y0:y1, x0:x1] = fg
     # GrabCut found (almost) nothing -> fall back to the whole box
-    if cv2.countNonZero(full) < 0.03 * w * h:
+    if cv2.countNonZero(full) < 0.03 * w * h and not keep.any():
         full[y:y + h, x:x + w] = 255
-    return full
+    # strokes win over everything (also over hole filling in _clean)
+    full = cv2.bitwise_or(full, keep)
+    full = cv2.bitwise_and(full, cv2.bitwise_not(remove))
+
+    # a "fill" stroke can just be the outline of the hidden part: whatever it closes
+    # off together with the visible object counts as hidden too
+    if fill.any():
+        both = cv2.bitwise_or(full, fill)
+        enclosed = cv2.bitwise_and(_fill_holes(both), cv2.bitwise_not(both))
+        enclosed = cv2.bitwise_and(enclosed, inside_full)
+        fill = cv2.bitwise_or(fill, enclosed)
+        fill = cv2.bitwise_and(fill, cv2.bitwise_not(full))   # only what's really hidden
+    return full, fill
+
+
+def complete_hidden(rgb, known, fill):
+    """Paint the hidden part of an object (fill) using the object's own colors:
+    every hidden pixel first takes the color of the nearest visible object pixel,
+    then the result is smoothed so it doesn't look streaky."""
+    if not fill.any() or not known.any():
+        return rgb
+    # sample colors a few pixels inside the object, not from its anti-aliased edge
+    # (the edge still has a bit of whatever was next to it)
+    inner = cv2.erode(known.astype(np.uint8), np.ones((7, 7), np.uint8)) > 0
+    if inner.sum() > 50:
+        known = inner
+    unknown = (~known).astype(np.uint8) * 255
+    _, labels = cv2.distanceTransformWithLabels(unknown, cv2.DIST_L2, 5,
+                                                labelType=cv2.DIST_LABEL_PIXEL)
+    ys, xs = np.nonzero(known)
+    lut = np.zeros((labels.max() + 1, 3), np.uint8)
+    lut[labels[ys, xs]] = rgb[ys, xs]
+    base = np.where(known[:, :, None], rgb, lut[labels])
+    smooth = _inpaint(base, fill.astype(np.uint8) * 255)
+    out = rgb.copy()
+    out[fill] = smooth[fill]
+    return out
 
 
 def _inpaint(img, hole):
@@ -155,14 +229,21 @@ def segment(image_path, boxes, out_dir=None, progress=None):
         b = boxes[i]
         if progress:
             progress(n, len(boxes), b.get("name", ""))
-        m = cut_object(img, b)
-        union = cv2.bitwise_or(union, m)
+        m, fill = cut_object(img, b)
+        # the background loses the object AND its hidden part (that area often still
+        # shows bits of the object); the background fill paints both over
+        union = cv2.bitwise_or(union, cv2.bitwise_or(m, fill))
         own = cv2.bitwise_and(m, cv2.bitwise_not(taken))
+        own = cv2.bitwise_or(own, fill)            # ...but belongs to this object's card
         taken = cv2.bitwise_or(taken, m)
 
         x, y, w, h = int(b["x"]), int(b["y"]), int(b["w"]), int(b["h"])
+        rgb = img[y:y + h, x:x + w].copy()
+        f = fill[y:y + h, x:x + w] > 0
+        if f.any():
+            rgb = complete_hidden(rgb, (own[y:y + h, x:x + w] > 0) & ~f, f)
         alpha = cv2.GaussianBlur(own, (3, 3), 0)[y:y + h, x:x + w]
-        rgba = cv2.cvtColor(img[y:y + h, x:x + w], cv2.COLOR_BGR2BGRA)
+        rgba = cv2.cvtColor(rgb, cv2.COLOR_BGR2BGRA)
         rgba[:, :, 3] = alpha
         fname = "cut_%02d_%s.png" % (i, _safe(b.get("name")))
         _write(os.path.join(out_dir, fname), rgba)
@@ -172,6 +253,7 @@ def segment(image_path, boxes, out_dir=None, progress=None):
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     hole = cv2.dilate(union, k, iterations=2)
     _write(os.path.join(out_dir, "background.png"), _inpaint(img, hole))
+    _write(os.path.join(out_dir, "background_hole.png"), cv2.dilate(hole, k, iterations=1))
     _write(os.path.join(out_dir, "masks_preview.png"), union)
 
     manifest = {"image": os.path.basename(image_path), "width": W, "height": H,

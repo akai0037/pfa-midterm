@@ -63,15 +63,24 @@ Start from a new empty scene (**File → New Scene**). The tool builds into the 
    - **Distance**: how far the object is from the camera. Smaller = closer = moves more when the camera moves. **Auto Distance** guesses from the drawing: lower in the picture = closer.
    - **Thickness %**: how thick cubes and inflated shapes are (% of the box's shorter side). Changes built objects right away.
 5. **Preview Cutouts** shows what gets cut out of each box. If a box grabs too much, make it tighter.
-6. **Save Boxes** writes `<image name>_boxes.json` next to the image. Next time you load the image, the boxes come back.
-7. **Scene settings:**
+6. **Fix a cut-out with the brushes** (row above the picture). Click a box, pick a brush, and paint on the picture:
+   - **+ Keep (K)** (green): parts of the object the cut-out missed. Painting outside the box makes the box bigger.
+   - **- Remove (R)** (red): things that touch the object but aren't part of it.
+   - **Fill hidden (F)** (yellow): a part of the object that's hidden behind something else. Paint it, or just draw its missing outline; the area it closes off with the object is painted in from the object's own colors.
+   - **Boxes (B)** goes back to editing boxes. **Brush** sets the size (`[` and `]` also work).
+   - **Undo (Ctrl+Z)** / **Redo (Ctrl+Y** or **Ctrl+Shift+Z)** step through the selected box's strokes (Cmd on a Mac). Inside this window they only undo strokes, not the Maya scene. **Clear Strokes** removes all of them (also undoable).
+   - If the preview is showing, it updates after every stroke. Strokes are saved with **Save Boxes**.
+   - **Zoom in for details:** mouse wheel zooms around the mouse; drag with the **middle mouse button** (or hold **Space** and drag) to move around; **0** or **Fit** shows the whole picture again.
+7. **Save Boxes** writes `<image name>_boxes.json` next to the image. Next time you load the image, the boxes come back.
+8. **Scene settings:**
    - **Focal length**: the camera lens. The drawing always lines up through the camera; a wider lens (smaller number) gives stronger parallax.
    - **Nearest / Farthest distance**: the range Auto Distance uses. The background card goes just behind Farthest.
    - **Proxies**: textured cards, colored cubes, inflated 3D, or AI 3D models (see above).
    - **Cut objects out of their boxes**: off = rectangular cards with the whole box.
    - **Background card**: the drawing (with objects painted out) behind everything.
+   - **AI background fill (LaMa, on this computer)**: when you Build, the holes left by the cut-out objects are painted in by an AI model, so the background looks like the drawing continues behind them, as if the objects came out of the picture. Runs on the computer's CPU (about 20-30 seconds per Build; the result is reused until you change the boxes). The first time it asks to install it (~250 MB: onnxruntime + the LaMa model, into your Maya user folder). Off = a quick, blurry fill.
    - **Camera drift**: adds the sideways camera move on frames 1-120. Frame 60 lines up exactly with the drawing.
-8. **Build Scene**. Building again replaces the old build. Ctrl+Z undoes it.
+9. **Build Scene**. Building again replaces the old build. Ctrl+Z undoes it.
 
 The tool remembers its settings. Everything it makes is saved next to your image, in a folder called `<image name>_its`.
 
@@ -90,7 +99,8 @@ Free GPU time on Hugging Face is limited: without an account it runs out after a
 - Window with image panel; draw, select, move, resize and nudge boxes; object list with name, distance and thickness; save/load boxes as JSON
 - Camera matched to the drawing (aspect ratio, film back, render resolution)
 - **Cut-outs:** inside each box, OpenCV GrabCut separates the object from what's around it. Nearer objects win where boxes overlap.
-- **Background fill:** the cut-out areas are painted over (OpenCV inpaint), so nothing shows up twice when the camera moves
+- **Correction brushes:** keep / remove / fill-hidden strokes fix a cut-out by hand; hidden parts of an object are completed from its own colors
+- **Background fill:** the cut-out areas are painted over, so nothing shows up twice when the camera moves. With the AI option, LaMa (Carve/LaMa-ONNX, runs locally) paints in background that matches the drawing; without it, a quick OpenCV fill
 - Each object placed at its distance and scaled so it covers its box exactly from the camera
 - Four kinds of proxies: textured cards (2.5D), colored cubes, inflated 3D meshes, AI 3D models (TRELLIS / Hunyuan3D-2 online, loaded from .glb)
 - Camera drift animation to show parallax
@@ -99,8 +109,9 @@ Free GPU time on Hugging Face is limited: without an account it runs out after a
 
 ## What doesn't work yet
 
-- **Cut-outs get confused when an object and its surroundings have similar colors.** In the sample, the mountains' cut-out keeps a bit of sky. GrabCut only looks at colors; SAM 2 understands shapes and should fix this.
-- **Background fill is blurry** where a big object was removed. Fine for small camera moves.
+- **Cut-outs get confused when an object and its surroundings have similar colors.** In the sample, the mountains' cut-out keeps a bit of sky. The brushes fix it by hand; SAM 2 (which understands shapes) should get it right on its own.
+- **Filled-in hidden parts are a smooth guess**: they take the object's nearby colors, so lines and details behind the occluder don't come back.
+- **The AI background fill works on a 512 × 512 version of the area around the holes**, so on big pictures the filled-in part is a bit softer than the rest. Without the AI option the fill is blurry.
 - **No automatic detection yet**: you draw every box.
 - **Distances are guessed** (from height in the picture) or typed in. They don't read the drawing's real depth yet.
 - **AI 3D depends on free online GPU time** (see above). The Hunyuan3D-2 textured mode currently errors on their server, so the tool uses its shape-only mode and paints the drawing on. AI models of flat cartoon drawings come out fairly flat, and the back of any 3D shape is a guess.
@@ -135,5 +146,6 @@ Free GPU time on Hugging Face is limited: without an account it runs out after a
 - `its_mesh.py`: turns a cut-out into an inflated 3D mesh
 - `its_ai3d.py`: sends a cut-out to TRELLIS / Hunyuan3D-2 and saves the .glb (runs outside Maya)
 - `its_glb.py`: reads .glb 3D files (Maya can't open them by itself)
+- `its_lama.py`: AI background fill with LaMa (runs outside Maya, on the CPU)
 - `examples/`: sample drawing, its boxes, and an AI model of its tree
 - `PITCH.md`: the original pitch and the feedback that changed the plan
