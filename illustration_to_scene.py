@@ -722,6 +722,41 @@ def inflated_mesh(cut_path, corners, detail, center=None):
     return node, cx, cy
 
 
+_min_cache = {}
+
+
+def object_min_detail(index):
+    """The lowest Mesh value that still changes box `index`'s built inflated mesh
+    (objects with thin arms and legs need small quads), or None if there's no limit
+    or it isn't built yet."""
+    import numpy as np
+    import cv2
+    import its_mesh
+    if not cmds.objExists(ROOT_GRP):
+        return None
+    for n in cmds.listRelatives(ROOT_GRP, allDescendents=True, type="transform", fullPath=True) or []:
+        if not (cmds.attributeQuery("itsMesh", node=n, exists=True) and
+                cmds.getAttr(n + ".itsIndex") == index):
+            continue
+        info = json.loads(cmds.getAttr(n + ".itsMesh"))
+        cut = info["cut"]
+        if not os.path.exists(cut):
+            return None
+        key = (cut, os.path.getmtime(cut))
+        if key not in _min_cache:
+            rgba = cv2.imdecode(np.fromfile(cut, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+            _min_cache[key] = its_mesh.min_detail(rgba[:, :, 3]) if rgba is not None and \
+                rgba.ndim == 3 and rgba.shape[2] == 4 else None
+        q = _min_cache[key]
+        if q is None:
+            return None
+        bx, by, bw, bh = info["box"]
+        W, H = info["image"]
+        # quads across the object -> the same number on the whole-picture scale
+        return int(np.ceil(q * max(W, H) / float(max(bw, bh))))
+    return None
+
+
 def set_mesh_detail(detail, index=None):
     """Live update: rebuild inflated meshes with a new number of quads (all of them,
     or only box number `index`). Only the shape is swapped, so moves, scales,
@@ -2176,17 +2211,25 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
     def _set_detail(self, v):
         """Scene settings' Mesh detail: sets every object (the Mesh column changes one)."""
         _set_pref("detail", int(v))
-        for i, b in enumerate(self.boxes):
-            b["detail"] = int(v)
-            spin = self.table.cellWidget(i, 3)
-            if spin is not None:
-                spin.blockSignals(True)
-                spin.setValue(int(v))
-                spin.blockSignals(False)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        raised = []
+        try:
+            for i, b in enumerate(self.boxes):
+                low = object_min_detail(i)
+                b["detail"] = max(int(v), low or 0)     # thin arms and legs need a minimum
+                if b["detail"] > v:
+                    raised.append("%s %d" % (b["name"], b["detail"]))
+                spin = self.table.cellWidget(i, 3)
+                if spin is not None:
+                    spin.blockSignals(True)
+                    spin.setValue(b["detail"])
+                    spin.blockSignals(False)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         cmds.undoInfo(openChunk=True, chunkName="illustrationScene_detail")
         try:
-            n = set_mesh_detail(int(v))
+            n = sum(set_mesh_detail(b["detail"], index=i) for i, b in enumerate(self.boxes))
         except Exception as e:
             traceback.print_exc()
             self.status("Changing the mesh detail failed: %s" % e, error=True)
@@ -2195,7 +2238,8 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             cmds.undoInfo(closeChunk=True)
             QtWidgets.QApplication.restoreOverrideCursor()
         if n:
-            self.status("Mesh detail %d: rebuilt %d inflated mesh(es)." % (v, n))
+            self.status("Mesh detail %d: rebuilt %d inflated mesh(es).%s" % (
+                v, n, (" Kept higher for thin parts: " + ", ".join(raised)) if raised else ""))
         else:
             self.status("Mesh detail %d: used by Inflated 3D on the next Build." % v)
 
@@ -2203,6 +2247,22 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         """Mesh column: more or fewer quads on one object's inflated mesh."""
         if not 0 <= i < len(self.boxes):
             return
+        note = ""
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        try:
+            low = object_min_detail(i)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if low and v < low:
+            # thin arms and legs need small quads: fewer than this would change nothing,
+            # so the number goes to the lowest one that does
+            v = low
+            spin = self.table.cellWidget(i, 3)
+            if spin is not None:
+                spin.blockSignals(True)
+                spin.setValue(v)
+                spin.blockSignals(False)
+            note = " (its thin parts need at least %d)" % low
         self.boxes[i]["detail"] = int(v)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         cmds.undoInfo(openChunk=True, chunkName="illustrationScene_detail")
@@ -2216,8 +2276,13 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             cmds.undoInfo(closeChunk=True)
             QtWidgets.QApplication.restoreOverrideCursor()
         name = self.boxes[i]["name"]
+        faces = ""
+        for node in cmds.listRelatives(ROOT_GRP, allDescendents=True, type="transform", fullPath=True) or [] \
+                if cmds.objExists(ROOT_GRP) else []:
+            if cmds.attributeQuery("itsMesh", node=node, exists=True) and cmds.getAttr(node + ".itsIndex") == i:
+                faces = ", %d faces" % cmds.polyEvaluate(node, face=True)
         if n:
-            self.status("'%s' mesh detail %d: mesh rebuilt." % (name, v))
+            self.status("'%s' mesh detail %d%s: mesh rebuilt%s." % (name, v, note, faces))
         else:
             self.status("'%s' mesh detail %d: used by Inflated 3D on the next Build." % (name, v))
 

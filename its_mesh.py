@@ -259,29 +259,58 @@ def split_thin(alpha, detail=40):
     return body_alpha, thin_alpha
 
 
+def _has_big_thin_parts(alpha):
+    """True for objects like a cat with long arms and legs: they get one connected mesh
+    with quads small enough for the thin parts (decided at a fixed detail, so the kind
+    of mesh doesn't flip back and forth while you change the detail)."""
+    h, w = alpha.shape[:2]
+    scale = float(WORK) / max(h, w)
+    whole = _smooth_mask(alpha, scale)
+    ref_thin = split_thin(alpha, 20)[1]
+    return bool(ref_thin.any()) and \
+        cv2.countNonZero((ref_thin > 127).astype(np.uint8)) > 0.05 * cv2.countNonZero(whole) / scale ** 2
+
+
+def _ladder():
+    """Quad counts across the object to try, the same list every time."""
+    k = 10.0
+    while k <= 400:
+        yield k
+        k *= 1.08
+
+
+def min_detail(alpha):
+    """The fewest quads across the object that still fit its thin parts, or None if
+    the object has no big thin parts (then any detail works)."""
+    if not _has_big_thin_parts(alpha):
+        return None
+    top = float(WORK)
+    for k in _ladder():
+        res = _inflate_one(alpha, k, cell=max(1.5, top / k), exact=True)
+        if res is not None and _coverage(res[0], res[1], alpha) > 0.97:
+            return int(np.ceil(k))
+    return None
+
+
 def inflate(alpha, detail=40):
     """detail = roughly how many quads across the object's longest side.
-    The main shape and its thin bits (legs, antennas...) are meshed separately: the
-    thin bits get smaller quads so they keep their shape, and the same height scale
-    as the main shape, so a thin leg stays thin. Both are returned as one mesh."""
+    Objects with big thin parts (a cat's arms and legs) become one connected mesh
+    with quads small enough for those parts (see min_detail). Otherwise the main shape
+    gets quads of the asked size and its few small thin bits (legs under a UFO) get
+    their own smaller quads, with the same height map. Returned as one mesh."""
     body, thin = split_thin(alpha, detail)
     h, w = alpha.shape[:2]
     scale = float(WORK) / max(h, w)
     whole = _smooth_mask(alpha, scale)
     cell = max(4.0, max(whole.shape) / float(detail))
-    # whether the thin parts are big is decided at a fixed detail, so the kind of
-    # mesh doesn't flip back and forth while you change the detail
-    ref_thin = split_thin(alpha, 20)[1]
-    if ref_thin.any() and cv2.countNonZero((ref_thin > 127).astype(np.uint8)) > 0.05 * cv2.countNonZero(whole) / scale ** 2:
+    if _has_big_thin_parts(alpha):
         # big thin parts (a cat's arms and legs): one connected mesh for the whole
         # object, with quads small enough for the thin parts to fit. Quad sizes come
         # from one fixed list (the same whatever `detail` is), tried from the size the
         # detail asks for downwards; so more detail never gives fewer, bigger quads
         top = max(whole.shape)
-        k = 10.0
-        while k <= 400:
+        for k in _ladder():
             c = top / k
-            k *= 1.08
             if c > cell * 1.0001:
                 continue
             res = _inflate_one(alpha, detail, cell=max(1.5, c), exact=True)
