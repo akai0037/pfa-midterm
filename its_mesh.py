@@ -263,12 +263,28 @@ def inflate(alpha, detail=40):
     thin bits get smaller quads so they keep their shape, and the same height scale
     as the main shape, so a thin leg stays thin. Both are returned as one mesh."""
     body, thin = split_thin(alpha, detail)
-    main = _inflate_one(body, detail)
+    h, w = alpha.shape[:2]
+    scale = float(WORK) / max(h, w)
+    whole = _smooth_mask(alpha, scale)
+    cell = max(4.0, max(whole.shape) / float(detail))
+    if thin.any() and cv2.countNonZero((thin > 127).astype(np.uint8)) > 0.05 * cv2.countNonZero(whole) / scale ** 2:
+        # big thin parts (a cat's arms and legs): one connected mesh for the whole
+        # object, with quads small enough for the thin parts to fit
+        for c in (cell, cell / 1.5, cell / 2.0, cell / 2.5, cell / 3.0, cell / 4.0):
+            res = _inflate_one(alpha, detail, cell=max(1.5, c))
+            if res is not None and _coverage(res[0], res[1], alpha) > 0.97:
+                return res[:3]
+    # one height map for the whole object, used by both parts: where a leg tucks in
+    # under the body, both surfaces are at the same height
+    field = cv2.GaussianBlur(cv2.distanceTransform(whole, cv2.DIST_L2, 5), (0, 0), max(1.0, cell * 0.8))
+    field = field / max(float(field.max()), 1e-6)
+    main = _inflate_one(body, detail, field=field)
     if main is None:
         return None
     verts, faces, uv, ref, s = main
     if thin.any():
-        extra = _inflate_one(thin, detail, cell=s / 4.0, ref=ref)
+        # small thin bits (a few legs under a UFO): their own smaller quads
+        extra = _inflate_one(thin, detail, cell=s / 4.0, field=field)
         if extra is not None:
             v2, f2, uv2 = extra[:3]
             faces = np.vstack([faces, f2 + len(verts)])
@@ -277,9 +293,10 @@ def inflate(alpha, detail=40):
     return verts, faces, uv
 
 
-def _inflate_one(alpha, detail=40, cell=None, ref=None):
+def _inflate_one(alpha, detail=40, cell=None, ref=None, field=None):
     """Mesh one shape. cell = quad size in working pixels (default: from detail);
-    ref = the height that counts as fully puffed (default: this shape's own).
+    ref = the height that counts as fully puffed (default: this shape's own);
+    field = a ready-made 0..1 height map at working size (overrides ref).
     Returns (verts, faces, uvs, ref, cell) or None."""
     h, w = alpha.shape[:2]
     scale = float(WORK) / max(h, w)
@@ -333,10 +350,13 @@ def _inflate_one(alpha, detail=40, cell=None, ref=None):
     is_rim = np.concatenate(all_rim)
 
     # 4. height: blurred distance from the edge, quarter-circle profile
-    soft = cv2.GaussianBlur(dist, (0, 0), max(1.0, s * 0.8))
-    if ref is None:
-        ref = max(float(soft.max()), 1e-6)
-    soft = soft / ref
+    if field is not None and field.shape == dist.shape:
+        soft = field
+    else:
+        soft = cv2.GaussianBlur(dist, (0, 0), max(1.0, s * 0.8))
+        if ref is None:
+            ref = max(float(soft.max()), 1e-6)
+        soft = soft / ref
     xi = np.clip(pts[:, 0].astype(int), 0, mw - 1)
     yi = np.clip(pts[:, 1].astype(int), 0, mh - 1)
     tt = np.clip(soft[yi, xi], 0.0, 1.0)
@@ -354,6 +374,15 @@ def _inflate_one(alpha, detail=40, cell=None, ref=None):
     uv = np.column_stack([verts_px[:, 0] / w, 1.0 - verts_px[:, 1] / h])
     back = back_id[faces][:, ::-1]                      # reversed: faces -z
     return verts, np.vstack([faces, back]), uv, ref, s
+
+
+def _coverage(verts, faces, alpha):
+    """How much of the object (alpha > 127) the mesh covers, seen from the front."""
+    seen = np.zeros(alpha.shape[:2], np.uint8)
+    for f in faces[:len(faces) // 2]:
+        cv2.fillPoly(seen, [np.round(verts[f, :2] * 8).astype(np.int32)], 255, shift=3)
+    want = alpha > 127
+    return float((want & (seen > 0)).sum()) / max(1, int(want.sum()))
 
 
 def is_closed(faces):
