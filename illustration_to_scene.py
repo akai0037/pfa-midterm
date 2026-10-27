@@ -465,7 +465,7 @@ class SceneBuilder(object):
         d = b["dist"]
         x0, y0, _ = self.to_world(b["x"], b["y"], d)
         x1, y1, _ = self.to_world(b["x"] + b["w"], b["y"] + b["h"], d)
-        detail = object_detail(self.detail, b, self.W, self.H)
+        detail = object_detail(b.get("detail", self.detail), b, self.W, self.H)
         res = inflated_mesh(cut_path, (x0, y0, x1, y1), detail)
         if res is None:
             print("[Illustration to 3D] Couldn't make an inflated mesh for '%s'; "
@@ -722,15 +722,17 @@ def inflated_mesh(cut_path, corners, detail, center=None):
     return node, cx, cy
 
 
-def set_mesh_detail(detail):
-    """Live update: rebuild every inflated mesh with a new number of quads. Only the
-    shape is swapped, so moves, scales, thickness and the material all stay.
-    Returns how many meshes were changed."""
+def set_mesh_detail(detail, index=None):
+    """Live update: rebuild inflated meshes with a new number of quads (all of them,
+    or only box number `index`). Only the shape is swapped, so moves, scales,
+    thickness and the material all stay. Returns how many meshes were changed."""
     if not cmds.objExists(ROOT_GRP):
         return 0
     done = 0
     for n in cmds.listRelatives(ROOT_GRP, allDescendents=True, type="transform", fullPath=True) or []:
         if not cmds.attributeQuery("itsMesh", node=n, exists=True):
+            continue
+        if index is not None and cmds.getAttr(n + ".itsIndex") != index:
             continue
         info = json.loads(cmds.getAttr(n + ".itsMesh"))
         if not os.path.exists(info["cut"]):
@@ -1435,14 +1437,18 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         # objects
         obj_box = QtWidgets.QGroupBox("Objects  (double-click a name to rename)")
         ol = QtWidgets.QVBoxLayout(obj_box)
-        self.table = QtWidgets.QTableWidget(0, 3)
-        self.table.setHorizontalHeaderLabels(["Name", "Distance", "Thickness %"])
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["Name", "Distance", "Thickness %", "Mesh"])
         self.table.horizontalHeaderItem(2).setToolTip(
-            "Cube thickness, as % of the box's shorter side.\n"
-            "Only used by Colored cubes. Changes built cubes right away.")
+            "How thick cubes and inflated meshes are, as % of the box's shorter side.\n"
+            "Changes built objects right away.")
+        self.table.horizontalHeaderItem(3).setToolTip(
+            "Mesh detail of this object's inflated mesh (same scale as Mesh detail in\n"
+            "Scene settings). Changes the built mesh right away.")
         self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
         self.table.verticalHeader().setVisible(True)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
@@ -1893,6 +1899,8 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             nb["dist"] = float(b["dist"]) if "dist" in b else self.auto_distance(nb)
             if "thick" in b:
                 nb["thick"] = float(b["thick"])
+            if "detail" in b:
+                nb["detail"] = int(b["detail"])
             if b.get("strokes"):
                 nb["strokes"] = [{"mode": st["mode"], "r": float(st["r"]) * (sx + sy) / 2.0,
                                   "pts": [[q[0] * sx, q[1] * sy] for q in st["pts"]]}
@@ -2126,7 +2134,7 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self._syncing = True
         # hide the old number boxes right away (Qt only deletes them a moment later)
         for row in range(self.table.rowCount()):
-            for col in (1, 2):
+            for col in (1, 2, 3):
                 old = self.table.cellWidget(row, col)
                 if old is not None:
                     old.hide()
@@ -2148,6 +2156,13 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             thick.setValue(b.get("thick", DEFAULT_THICK))
             thick.valueChanged.connect(lambda v, i=i: self._set_thick(i, v))
             self.table.setCellWidget(i, 2, thick)
+            mesh = QtWidgets.QSpinBox()
+            mesh.setRange(10, 300)
+            mesh.setSingleStep(10)
+            mesh.setKeyboardTracking(False)          # typed numbers apply on Enter
+            mesh.setValue(int(b.get("detail", self.sp_detail.value())))
+            mesh.valueChanged.connect(lambda v, i=i: self._set_obj_detail(i, v))
+            self.table.setCellWidget(i, 3, mesh)
         self._syncing = False
         if 0 <= selected < len(self.boxes):
             self.table.selectRow(selected)
@@ -2159,7 +2174,15 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             self._invalidate_cutouts()   # nearer/farther order changed
 
     def _set_detail(self, v):
+        """Scene settings' Mesh detail: sets every object (the Mesh column changes one)."""
         _set_pref("detail", int(v))
+        for i, b in enumerate(self.boxes):
+            b["detail"] = int(v)
+            spin = self.table.cellWidget(i, 3)
+            if spin is not None:
+                spin.blockSignals(True)
+                spin.setValue(int(v))
+                spin.blockSignals(False)
         QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
         cmds.undoInfo(openChunk=True, chunkName="illustrationScene_detail")
         try:
@@ -2175,6 +2198,28 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             self.status("Mesh detail %d: rebuilt %d inflated mesh(es)." % (v, n))
         else:
             self.status("Mesh detail %d: used by Inflated 3D on the next Build." % v)
+
+    def _set_obj_detail(self, i, v):
+        """Mesh column: more or fewer quads on one object's inflated mesh."""
+        if not 0 <= i < len(self.boxes):
+            return
+        self.boxes[i]["detail"] = int(v)
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        cmds.undoInfo(openChunk=True, chunkName="illustrationScene_detail")
+        try:
+            n = set_mesh_detail(int(v), index=i)
+        except Exception as e:
+            traceback.print_exc()
+            self.status("Changing the mesh detail failed: %s" % e, error=True)
+            return
+        finally:
+            cmds.undoInfo(closeChunk=True)
+            QtWidgets.QApplication.restoreOverrideCursor()
+        name = self.boxes[i]["name"]
+        if n:
+            self.status("'%s' mesh detail %d: mesh rebuilt." % (name, v))
+        else:
+            self.status("'%s' mesh detail %d: used by Inflated 3D on the next Build." % (name, v))
 
     def _set_thick(self, i, v):
         if 0 <= i < len(self.boxes):

@@ -70,6 +70,7 @@ Start from a new empty scene (**File → New Scene**). The tool builds into the 
    - **Name**: double-click to rename. It becomes the Maya object's name.
    - **Distance**: how far the object is from the camera. Smaller = closer = moves more when the camera moves. **Auto Distance** guesses from the drawing: lower in the picture = closer. Changes take effect on the next Build.
    - **Thickness %**: how thick cubes and inflated shapes are (% of the box's shorter side). Changes built objects right away.
+   - **Mesh**: how many quads this object's inflated mesh has (same scale as **Mesh detail** in Scene settings). Changes only this object's built mesh, right away.
 5. **Preview Cutouts** shows what gets cut out of each box. If a box grabs too much, make it tighter.
 6. **Fix a cut-out with the brushes** (row above the picture). Click a box, pick a brush, and paint on the picture:
    - **+ Keep (K)** (green): parts of the object the cut-out missed. Painting outside the box makes the box bigger.
@@ -85,7 +86,7 @@ Start from a new empty scene (**File → New Scene**). The tool builds into the 
    - **Focal length**: the camera lens. The drawing always lines up through the camera; a wider lens (smaller number) gives stronger parallax.
    - **Nearest / Farthest distance**: the range Auto Distance uses. The background card goes just behind Farthest.
    - **Proxies**: textured cards, colored cubes, inflated 3D, or AI 3D models (see above).
-   - **Mesh detail**: how many quads the inflated 3D meshes have, counted across the whole picture, so every object gets quads of about the same size (a small window gets fewer than the big UFO it's on). The arrows add or remove quads; built meshes update right away and keep their moves, thickness and material.
+   - **Mesh detail**: how many quads the inflated 3D meshes have, counted across the whole picture, so every object gets quads of about the same size (a small window gets fewer than the big UFO it's on). The arrows add or remove quads on **every** object (use the **Mesh** column for just one); built meshes update right away and keep their moves, thickness and material.
    - **Cut objects out of their boxes**: only for textured cards; off = rectangular cards with the whole box. Inflated and AI models always use the cut-outs.
    - **AI background fill (LaMa, on this computer)**: when you Build, the holes left by the cut-out objects are painted in by an AI model, so the background looks like the drawing continues behind them, as if the objects came out of the picture. Runs on the computer's CPU (about 20-30 seconds per Build; the result is reused until you change the boxes). The first time it asks to install it (~250 MB: onnxruntime + the LaMa model, into your Maya user folder). Off = a quick, blurry fill.
    - **Background card**: the drawing (with objects painted out) behind everything.
