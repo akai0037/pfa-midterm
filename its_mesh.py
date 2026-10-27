@@ -155,9 +155,10 @@ def _quad_part(shape, rings, s, strict=True):
             loop.append(v)
             v = nxt[v]
         loops.append(loop)
-    # the grid must have one border loop per outline (outer edge + one per hole);
-    # if a thin part split the grid in two, the caller tries smaller cells
-    if len(loops) != len(rings):
+    # one border loop per outline (outer edge + one per hole). More loops than outlines
+    # means a thin part split the grid in two: the caller tries smaller cells. Fewer
+    # means a hole is smaller than a cell: the mesh simply covers that hole
+    if len(loops) > len(rings):
         return None
 
     # round off the stairs: each border point moves halfway toward the middle of its
@@ -213,7 +214,8 @@ def _quad_part(shape, rings, s, strict=True):
             spread = spread | np.roll(spread, 1) | np.roll(spread, -1)
             smoothed = (np.roll(steps, 1) + steps + np.roll(steps, -1)) / 3.0
             steps = np.where(spread, smoothed, steps)
-        if twisted.any() and strict:
+        # a couple of slightly twisted quads on a long edge don't show; more do
+        if strict and twisted.sum() > max(2, 0.02 * n):
             return None           # this cell size doesn't fit the shape; try smaller cells
         base = n_grid + sum(len(x) for x in rim_pts)
         rim_pts.append(on_curve)
@@ -267,11 +269,22 @@ def inflate(alpha, detail=40):
     scale = float(WORK) / max(h, w)
     whole = _smooth_mask(alpha, scale)
     cell = max(4.0, max(whole.shape) / float(detail))
-    if thin.any() and cv2.countNonZero((thin > 127).astype(np.uint8)) > 0.05 * cv2.countNonZero(whole) / scale ** 2:
+    # whether the thin parts are big is decided at a fixed detail, so the kind of
+    # mesh doesn't flip back and forth while you change the detail
+    ref_thin = split_thin(alpha, 20)[1]
+    if ref_thin.any() and cv2.countNonZero((ref_thin > 127).astype(np.uint8)) > 0.05 * cv2.countNonZero(whole) / scale ** 2:
         # big thin parts (a cat's arms and legs): one connected mesh for the whole
-        # object, with quads small enough for the thin parts to fit
-        for c in (cell, cell / 1.5, cell / 2.0, cell / 2.5, cell / 3.0, cell / 4.0):
-            res = _inflate_one(alpha, detail, cell=max(1.5, c))
+        # object, with quads small enough for the thin parts to fit. Quad sizes come
+        # from one fixed list (the same whatever `detail` is), tried from the size the
+        # detail asks for downwards; so more detail never gives fewer, bigger quads
+        top = max(whole.shape)
+        k = 10.0
+        while k <= 400:
+            c = top / k
+            k *= 1.08
+            if c > cell * 1.0001:
+                continue
+            res = _inflate_one(alpha, detail, cell=max(1.5, c), exact=True)
             if res is not None and _coverage(res[0], res[1], alpha) > 0.97:
                 return res[:3]
     # one height map for the whole object, used by both parts: where a leg tucks in
@@ -293,10 +306,11 @@ def inflate(alpha, detail=40):
     return verts, faces, uv
 
 
-def _inflate_one(alpha, detail=40, cell=None, ref=None, field=None):
+def _inflate_one(alpha, detail=40, cell=None, ref=None, field=None, exact=False):
     """Mesh one shape. cell = quad size in working pixels (default: from detail);
     ref = the height that counts as fully puffed (default: this shape's own);
-    field = a ready-made 0..1 height map at working size (overrides ref).
+    field = a ready-made 0..1 height map at working size (overrides ref);
+    exact = use exactly this quad size (no smaller sizes tried, no twisted quads).
     Returns (verts, faces, uvs, ref, cell) or None."""
     h, w = alpha.shape[:2]
     scale = float(WORK) / max(h, w)
@@ -312,7 +326,7 @@ def _inflate_one(alpha, detail=40, cell=None, ref=None, field=None):
     for c, info in zip(contours, hier[0]):
         if cv2.contourArea(c) < 4:
             continue
-        ring, _, _ = _outline(c, s / 3.0)
+        ring, _, _ = _outline(c, min(s / 3.0, 3.0))   # light smoothing: thin parts survive
         cv2.fillPoly(shape, [np.round(ring * 16).astype(np.int32)], 0 if info[3] >= 0 else 255,
                      lineType=cv2.LINE_8, shift=4)
     dist = cv2.distanceTransform(shape, cv2.DIST_L2, 5)
@@ -326,14 +340,18 @@ def _inflate_one(alpha, detail=40, cell=None, ref=None, field=None):
         if cv2.countNonZero(piece) < 12:
             continue
         cs, hs = cv2.findContours(piece, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
-        rings = [_outline(c, 1) for c in cs if len(c) >= 4]
+        # outer edge first, then the holes (_quad_part counts rings[1:] as holes)
+        order = sorted(range(len(cs)), key=lambda j: hs[0][j][3] >= 0)
+        rings = [_outline(cs[j], 1) for j in order if len(cs[j]) >= 4]
         if not rings:
             continue
         res = None
-        for size in (s, s / 1.5, s / 2.0, s / 3.0, s / 4.0, s / 6.0):
+        for size in ((s,) if exact else (s, s / 1.5, s / 2.0, s / 3.0, s / 4.0, s / 6.0)):
             res = _quad_part(piece, rings, max(1.5, size))
             if res is not None:
                 break
+        if res is None and exact:
+            return None
         if res is None:
             res = _quad_part(piece, rings, s, strict=False)
         if res is None:

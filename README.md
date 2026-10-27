@@ -70,7 +70,7 @@ Start from a new empty scene (**File → New Scene**). The tool builds into the 
    - **Name**: double-click to rename. It becomes the Maya object's name.
    - **Distance**: how far the object is from the camera. Smaller = closer = moves more when the camera moves. **Auto Distance** guesses from the drawing: lower in the picture = closer. Changes take effect on the next Build.
    - **Thickness %**: how thick cubes and inflated shapes are (% of the box's shorter side). Changes built objects right away.
-   - **Mesh**: how many quads this object's inflated mesh has (same scale as **Mesh detail** in Scene settings). Changes only this object's built mesh, right away.
+   - **Mesh**: how many quads this object's inflated mesh has (same scale as **Mesh detail** in Scene settings). Changes only this object's built mesh, right away. Objects with long thin parts (a cat's arms and legs) have a minimum: below it the quads would be too big for the thin parts, so lower numbers keep that minimum.
 5. **Preview Cutouts** shows what gets cut out of each box. If a box grabs too much, make it tighter.
 6. **Fix a cut-out with the brushes** (row above the picture). Click a box, pick a brush, and paint on the picture:
    - **+ Keep (K)** (green): parts of the object the cut-out missed. Painting outside the box makes the box bigger.

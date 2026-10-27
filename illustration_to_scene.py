@@ -1494,7 +1494,7 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self.cb_proxy = QtWidgets.QComboBox()
         self.cb_proxy.addItems(PROXY_TYPES)
         self.sp_detail = QtWidgets.QSpinBox()
-        self.sp_detail.setRange(10, 300)
+        self.sp_detail.setRange(10, 600)
         self.sp_detail.setSingleStep(10)
         self.sp_detail.setSuffix(" quads across")
         self.sp_detail.setToolTip(
@@ -2157,7 +2157,7 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             thick.valueChanged.connect(lambda v, i=i: self._set_thick(i, v))
             self.table.setCellWidget(i, 2, thick)
             mesh = QtWidgets.QSpinBox()
-            mesh.setRange(10, 300)
+            mesh.setRange(10, 600)
             mesh.setSingleStep(10)
             mesh.setKeyboardTracking(False)          # typed numbers apply on Enter
             mesh.setValue(int(b.get("detail", self.sp_detail.value())))
