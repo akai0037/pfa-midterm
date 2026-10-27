@@ -229,6 +229,42 @@ def _inpaint(img, hole):
     return (filled * soft + img * (1 - soft)).astype(np.uint8)
 
 
+def container(i, boxes, tol=4):
+    """Index of the smallest other box that box i sits inside (a window on a UFO),
+    or None. tol = how many pixels it may poke out and still count as inside."""
+    b = boxes[i]
+    best, best_area = None, None
+    for j, o in enumerate(boxes):
+        if j == i:
+            continue
+        inside = (b["x"] >= o["x"] - tol and b["y"] >= o["y"] - tol and
+                  b["x"] + b["w"] <= o["x"] + o["w"] + tol and
+                  b["y"] + b["h"] <= o["y"] + o["h"] + tol)
+        area = o["w"] * o["h"]
+        if inside and area > b["w"] * b["h"] and (best is None or area < best_area):
+            best, best_area = j, area
+    return best
+
+
+def cut_order(boxes):
+    """Order to cut objects out in: nearest first, so nearer objects claim the pixels
+    they cover. A box inside another one always goes before it, whatever its distance:
+    it's a detail ON that object (a window), not something behind it."""
+    eff = {}
+
+    def effective(i, seen=()):
+        if i in eff:
+            return eff[i]
+        d = boxes[i].get("dist", 0)
+        c = container(i, boxes)
+        if c is not None and c not in seen:
+            d = min(d, effective(c, seen + (i,)) - 1e-3)
+        eff[i] = d
+        return d
+
+    return sorted(range(len(boxes)), key=effective)
+
+
 def segment(image_path, boxes, out_dir=None, progress=None):
     """Cut out every box. Returns a manifest dict (also saved as manifest.json)."""
     img = _read(image_path)
@@ -237,8 +273,7 @@ def segment(image_path, boxes, out_dir=None, progress=None):
         out_dir = os.path.splitext(image_path)[0] + "_its"
     os.makedirs(out_dir, exist_ok=True)
 
-    # nearest first: nearer objects claim their pixels first
-    order = sorted(range(len(boxes)), key=lambda i: boxes[i].get("dist", 0))
+    order = cut_order(boxes)
     taken = np.zeros((H, W), np.uint8)
     union = np.zeros((H, W), np.uint8)
     results = {}

@@ -1551,6 +1551,21 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
 
     # --- boxes ----------------------------------------------------------------
     def auto_distance(self, b):
+        """Guess a box's distance. Lower in the picture = closer. A box inside another
+        box (a window on a UFO) is a detail on that object: it goes on the outer
+        object's front surface instead, so it isn't hidden behind it."""
+        import its_segment
+        i = next((k for k, o in enumerate(self.boxes) if o is b), None)
+        boxes = self.boxes if i is not None else self.boxes + [b]
+        c = its_segment.container(len(boxes) - 1 if i is None else i, boxes)
+        if c is not None:
+            o = boxes[c]
+            d = o.get("dist") or self.auto_distance(o)
+            # half the outer object's thickness = how far its front bulges toward the camera
+            half_w = d * (FILM_APERTURE * 25.4 / 2.0) / self.sp_focal.value()
+            px = 2.0 * half_w / float(self.img_w)                # world size of one pixel there
+            depth = min(o["w"], o["h"]) * px * o.get("thick", DEFAULT_THICK) / 100.0
+            return round(max(self.sp_near.value() * 0.5, d - depth / 2.0), 1)
         near, far = self.sp_near.value(), max(self.sp_far.value(), self.sp_near.value() + 1)
         t = min(max((b["y"] + b["h"]) / float(self.img_h), 0.0), 1.0)  # 0 top .. 1 bottom
         return round(far - t * (far - near), 1)
@@ -1608,7 +1623,10 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
     def auto_distance_all(self):
         if not self.img_h:
             return
-        for b in self.boxes:
+        import its_segment
+        # outer boxes first, so a box inside another can sit on its new front surface
+        nested = [its_segment.container(i, self.boxes) is not None for i in range(len(self.boxes))]
+        for b, inner in sorted(zip(self.boxes, nested), key=lambda p: p[1]):
             b["dist"] = self.auto_distance(b)
         self.refresh(selected=self.table.currentRow())
         self.status("Distances guessed from where each box sits in the drawing.")
@@ -2110,6 +2128,15 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             root, cam, made = builder.build()
             self.status("Built %d proxies and camera '%s'. The viewport now looks through it. "
                         "%s undoes the whole build." % (len(made), cam, UNDO_KEY))
+            import its_segment
+            for i, b in enumerate(self.boxes):
+                c = its_segment.container(i, self.boxes)
+                if c is not None and b["dist"] >= self.boxes[c]["dist"]:
+                    self.status("Built. Note: '%s' is inside '%s' but farther away, so it's "
+                                "hidden behind it. Give it a smaller distance (Auto Distance "
+                                "puts it on the front)." % (b["name"], self.boxes[c]["name"]),
+                                error=True)
+                    break
         except Exception as e:
             traceback.print_exc()
             self.status("Build failed: %s (see Script Editor)" % e, error=True)
