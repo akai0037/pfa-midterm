@@ -70,6 +70,7 @@ PROXY_TYPES = ["Textured cards (2.5D)", "Colored cubes (layout check)",
                "Inflated 3D (local)", "AI 3D models (use generated)"]
 P_CARDS, P_CUBES, P_INFLATE, P_AI = range(4)
 DEFAULT_THICK = 20.0   # cube thickness, % of the box's shorter side
+DEFAULT_DETAIL = 70    # inflated meshes: quads across the picture's longest side
 
 # one color per box, shared by the cubes and the Preview Cutouts tint
 CUBE_COLORS = [(255, 90, 90), (90, 220, 120), (90, 160, 255), (255, 200, 60),
@@ -309,9 +310,10 @@ class SceneBuilder(object):
 
     def __init__(self, image_path, width, height, boxes,
                  focal=35.0, proxy_type=0, background=True, drift=True,
-                 far=40.0, cutouts=None, ai_projection=False):
+                 far=40.0, cutouts=None, ai_projection=False, detail=DEFAULT_DETAIL):
         self.cutouts = cutouts   # manifest from its_segment.segment(), or None
         self.ai_projection = ai_projection   # paint AI models with the drawing even if they have a texture
+        self.detail = detail                 # inflated meshes: quads across the whole picture
         self.image_path = image_path.replace("\\", "/")
         self.W = float(width)
         self.H = float(height)
@@ -460,43 +462,17 @@ class SceneBuilder(object):
 
     def make_inflated(self, name, b, cut_path, sg, parent, index=0, thick=DEFAULT_THICK):
         """Puffy mesh in the shape of the cut-out object (see its_mesh.py)."""
-        import numpy as np
-        import cv2
-        import its_mesh
-        import maya.api.OpenMaya as om2
-
-        rgba = cv2.imdecode(np.fromfile(cut_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
-        if rgba is None or rgba.ndim < 3 or rgba.shape[2] < 4:
-            return None
-        res = its_mesh.inflate(rgba[:, :, 3])
+        d = b["dist"]
+        x0, y0, _ = self.to_world(b["x"], b["y"], d)
+        x1, y1, _ = self.to_world(b["x"] + b["w"], b["y"] + b["h"], d)
+        detail = object_detail(self.detail, b, self.W, self.H)
+        res = inflated_mesh(cut_path, (x0, y0, x1, y1), detail)
         if res is None:
             print("[Illustration to 3D] Couldn't make an inflated mesh for '%s'; "
                   "it gets a flat card instead." % b["name"])
             return None
-        verts, faces, uvs = res
-        ph, pw = rgba.shape[:2]
-        d = b["dist"]
-        x0, y0, _ = self.to_world(b["x"], b["y"], d)
-        x1, y1, _ = self.to_world(b["x"] + b["w"], b["y"] + b["h"], d)
-        wx = x0 + verts[:, 0] / pw * (x1 - x0)
-        wy = y0 + verts[:, 1] / ph * (y1 - y0)
-        # build the mesh around its own middle and move it there with translate, so the
-        # move / scale handles sit on the object (not at the origin, where the camera is)
-        cx = (wx.min() + wx.max()) / 2.0
-        cy = (wy.min() + wy.max()) / 2.0
-        wx, wy = wx - cx, wy - cy
-        pts = om2.MFloatPointArray()
-        pts.setLength(len(verts))
-        for k in range(len(verts)):
-            pts[k] = om2.MFloatPoint(float(wx[k]), float(wy[k]), float(verts[k, 2]))
-        counts = om2.MIntArray([faces.shape[1]] * len(faces))   # quads
-        connects = om2.MIntArray(faces.reshape(-1).astype(int).tolist())
-        fn = om2.MFnMesh()
-        obj = fn.create(pts, counts, connects,
-                        uvs[:, 0].astype(float).tolist(), uvs[:, 1].astype(float).tolist())
-        fn.assignUVs(counts, connects)
-        node = cmds.rename(om2.MFnDagNode(obj).fullPathName(), name)
-        cmds.polySoftEdge(node, angle=180, constructionHistory=False)
+        node, cx, cy = res
+        node = cmds.rename(node, name)
         cmds.setAttr(node + ".translateX", cx)
         cmds.setAttr(node + ".translateY", cy)
         cmds.setAttr(node + ".translateZ", -d)
@@ -509,6 +485,12 @@ class SceneBuilder(object):
         cmds.setAttr(node + ".itsMinSide", min(abs(x1 - x0), abs(y1 - y0)))
         cmds.addAttr(node, longName="itsKind", dataType="string")
         cmds.setAttr(node + ".itsKind", "inflate", type="string")
+        # what's needed to rebuild the mesh later with a different number of quads
+        cmds.addAttr(node, longName="itsMesh", dataType="string")
+        cmds.setAttr(node + ".itsMesh", json.dumps({
+            "cut": cut_path.replace("\\", "/"), "corners": [x0, y0, x1, y1],
+            "center": [cx, cy], "box": [b["x"], b["y"], b["w"], b["h"]],
+            "image": [self.W, self.H]}), type="string")
         apply_thickness(node, thick)
         return cmds.parent(node, parent)[0]
 
@@ -685,6 +667,91 @@ class SceneBuilder(object):
 
         look_through(cam)
         return root, cam, made
+
+
+def object_detail(detail, b, W, H):
+    """Mesh detail is set for the whole picture (quads across its longest side), so
+    every object gets quads of about the same size: a small window gets fewer quads
+    than the big UFO it sits on. Returns quads across this object's longest side."""
+    return max(6, int(round(detail * max(b["w"], b["h"]) / float(max(W, H)))))
+
+
+def inflated_mesh(cut_path, corners, detail, center=None):
+    """Make the inflated mesh of a cut-out (see its_mesh.py), placed so that from the
+    camera it covers the box whose world corners are (x0, y0, x1, y1). The points are
+    stored around the middle (cx, cy), so the transform can sit on the object.
+    Returns (transform, cx, cy), or None if no mesh could be made."""
+    import numpy as np
+    import cv2
+    import its_mesh
+    import maya.api.OpenMaya as om2
+
+    rgba = cv2.imdecode(np.fromfile(cut_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if rgba is None or rgba.ndim < 3 or rgba.shape[2] < 4:
+        return None
+    # with very few quads a narrow shape may not fit even one grid cell: use a few more
+    for quads in (detail, detail + 3, detail * 2, detail * 3):
+        res = its_mesh.inflate(rgba[:, :, 3], detail=quads)
+        if res is not None:
+            break
+    if res is None:
+        return None
+    verts, faces, uvs = res
+    ph, pw = rgba.shape[:2]
+    x0, y0, x1, y1 = corners
+    wx = x0 + verts[:, 0] / pw * (x1 - x0)
+    wy = y0 + verts[:, 1] / ph * (y1 - y0)
+    # build the mesh around its own middle and move it there with translate, so the
+    # move / scale handles sit on the object (not at the origin, where the camera is)
+    if center is None:
+        center = ((wx.min() + wx.max()) / 2.0, (wy.min() + wy.max()) / 2.0)
+    cx, cy = center
+    wx, wy = wx - cx, wy - cy
+    pts = om2.MFloatPointArray()
+    pts.setLength(len(verts))
+    for k in range(len(verts)):
+        pts[k] = om2.MFloatPoint(float(wx[k]), float(wy[k]), float(verts[k, 2]))
+    counts = om2.MIntArray([faces.shape[1]] * len(faces))   # quads
+    connects = om2.MIntArray(faces.reshape(-1).astype(int).tolist())
+    fn = om2.MFnMesh()
+    obj = fn.create(pts, counts, connects,
+                    uvs[:, 0].astype(float).tolist(), uvs[:, 1].astype(float).tolist())
+    fn.assignUVs(counts, connects)
+    node = om2.MFnDagNode(obj).fullPathName()
+    cmds.polySoftEdge(node, angle=180, constructionHistory=False)
+    return node, cx, cy
+
+
+def set_mesh_detail(detail):
+    """Live update: rebuild every inflated mesh with a new number of quads. Only the
+    shape is swapped, so moves, scales, thickness and the material all stay.
+    Returns how many meshes were changed."""
+    if not cmds.objExists(ROOT_GRP):
+        return 0
+    done = 0
+    for n in cmds.listRelatives(ROOT_GRP, allDescendents=True, type="transform", fullPath=True) or []:
+        if not cmds.attributeQuery("itsMesh", node=n, exists=True):
+            continue
+        info = json.loads(cmds.getAttr(n + ".itsMesh"))
+        if not os.path.exists(info["cut"]):
+            continue
+        bx, by, bw, bh = info["box"]
+        quads = object_detail(detail, {"w": bw, "h": bh}, *info["image"])
+        res = inflated_mesh(info["cut"], info["corners"], quads, center=info["center"])
+        if res is None:
+            continue
+        tmp = res[0]
+        old_shapes = cmds.listRelatives(n, shapes=True, fullPath=True) or []
+        sgs = cmds.listConnections(old_shapes[0], type="shadingEngine") if old_shapes else None
+        new_shape = cmds.listRelatives(tmp, shapes=True, fullPath=True)[0]
+        cmds.delete(old_shapes)
+        new_shape = cmds.parent(new_shape, n, shape=True, relative=True)[0]
+        cmds.delete(tmp)
+        cmds.rename(new_shape, n.split("|")[-1] + "Shape")
+        if sgs:
+            cmds.sets(n, edit=True, forceElement=sgs[0])
+        done += 1
+    return done
 
 
 def bleed_texture(cut_path):
@@ -1271,6 +1338,9 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
 
         self._build_ui()
         self._load_prefs()
+        # connected after the saved value is loaded, so opening the window changes nothing
+        self.sp_detail.setKeyboardTracking(False)      # typed numbers apply on Enter
+        self.sp_detail.valueChanged.connect(self._set_detail)
         QtWidgets.QApplication.instance().installEventFilter(self)
         self.status("Load an illustration to start.")
 
@@ -1417,6 +1487,14 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self.sp_far.setRange(1, 2000)
         self.cb_proxy = QtWidgets.QComboBox()
         self.cb_proxy.addItems(PROXY_TYPES)
+        self.sp_detail = QtWidgets.QSpinBox()
+        self.sp_detail.setRange(10, 300)
+        self.sp_detail.setSingleStep(10)
+        self.sp_detail.setSuffix(" quads across")
+        self.sp_detail.setToolTip(
+            "How many quads the inflated 3D meshes have: about this many across the\n"
+            "whole picture, so small objects get fewer and big ones more.\n"
+            "Changes built meshes right away (moves and thickness stay).")
         self.chk_bg = QtWidgets.QCheckBox("Background card with the full drawing")
         self.chk_drift = QtWidgets.QCheckBox("Camera drift (parallax test, frames 1-120)")
         self.chk_cut = QtWidgets.QCheckBox("Cut objects out of their boxes + fill the background")
@@ -1424,12 +1502,13 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         # (stretched to the right edge), checkboxes on the same left edge as the labels
         fl.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
         fl.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
-        for field in (self.sp_focal, self.sp_near, self.sp_far, self.cb_proxy):
+        for field in (self.sp_focal, self.sp_near, self.sp_far, self.cb_proxy, self.sp_detail):
             field.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         fl.addRow("Focal length", self.sp_focal)
         fl.addRow("Nearest distance", self.sp_near)
         fl.addRow("Farthest distance", self.sp_far)
         fl.addRow("Proxies", self.cb_proxy)
+        fl.addRow("Mesh detail", self.sp_detail)
         fl.addRow(self.chk_cut)
         self.chk_lama = QtWidgets.QCheckBox("AI background fill (LaMa, on this computer)")
         self.chk_lama.setToolTip(
@@ -1499,6 +1578,7 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self.sp_near.setValue(float(_pref("near", 6.0)))
         self.sp_far.setValue(float(_pref("far", 40.0)))
         self.cb_proxy.setCurrentIndex(int(_pref("proxy", 0)))
+        self.sp_detail.setValue(int(_pref("detail", DEFAULT_DETAIL)))
         self.chk_bg.setChecked(bool(_pref("bg", 1)))
         self.chk_drift.setChecked(bool(_pref("drift", 1)))
         self.chk_cut.setChecked(bool(_pref("cut", 1)))
@@ -1511,6 +1591,7 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         _set_pref("near", float(self.sp_near.value()))
         _set_pref("far", float(self.sp_far.value()))
         _set_pref("proxy", self.cb_proxy.currentIndex())
+        _set_pref("detail", int(self.sp_detail.value()))
         _set_pref("bg", self.chk_bg.isChecked())
         _set_pref("drift", self.chk_drift.isChecked())
 
@@ -2077,6 +2158,24 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
             self.boxes[i]["dist"] = float(v)
             self._invalidate_cutouts()   # nearer/farther order changed
 
+    def _set_detail(self, v):
+        _set_pref("detail", int(v))
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+        cmds.undoInfo(openChunk=True, chunkName="illustrationScene_detail")
+        try:
+            n = set_mesh_detail(int(v))
+        except Exception as e:
+            traceback.print_exc()
+            self.status("Changing the mesh detail failed: %s" % e, error=True)
+            return
+        finally:
+            cmds.undoInfo(closeChunk=True)
+            QtWidgets.QApplication.restoreOverrideCursor()
+        if n:
+            self.status("Mesh detail %d: rebuilt %d inflated mesh(es)." % (v, n))
+        else:
+            self.status("Mesh detail %d: used by Inflated 3D on the next Build." % v)
+
     def _set_thick(self, i, v):
         if 0 <= i < len(self.boxes):
             self.boxes[i]["thick"] = float(v)
@@ -2122,7 +2221,7 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
                                background=self.chk_bg.isChecked(),
                                drift=self.chk_drift.isChecked(),
                                far=max(self.sp_far.value(), max([b["dist"] for b in self.boxes] or [1])),
-                               cutouts=cutouts)
+                               cutouts=cutouts, detail=self.sp_detail.value())
         cmds.undoInfo(openChunk=True, chunkName="illustrationScene_build")
         try:
             root, cam, made = builder.build()
