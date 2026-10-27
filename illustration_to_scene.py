@@ -1420,6 +1420,12 @@ class IllustrationToSceneUI(QtWidgets.QDialog):
         self.chk_bg = QtWidgets.QCheckBox("Background card with the full drawing")
         self.chk_drift = QtWidgets.QCheckBox("Camera drift (parallax test, frames 1-120)")
         self.chk_cut = QtWidgets.QCheckBox("Cut objects out of their boxes + fill the background")
+        # tidy columns: labels on the left edge, every field the same width
+        # (stretched to the right edge), checkboxes on the same left edge as the labels
+        fl.setLabelAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignVCenter)
+        fl.setFieldGrowthPolicy(QtWidgets.QFormLayout.AllNonFixedFieldsGrow)
+        for field in (self.sp_focal, self.sp_near, self.sp_far, self.cb_proxy):
+            field.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         fl.addRow("Focal length", self.sp_focal)
         fl.addRow("Nearest distance", self.sp_near)
         fl.addRow("Farthest distance", self.sp_far)
